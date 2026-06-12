@@ -55,16 +55,7 @@ class ScratchLinkWebSocket { /* ... */ }
 module.exports = ScratchLinkWebSocket;
 ```
 
-권장 변경 (둘 중 하나):
-
-**옵션 A — 새 이름으로 export + 옛 이름 alias 유지 (호환):**
-```js
-class AluxLabsLinkWebSocket { /* ... */ }
-module.exports = AluxLabsLinkWebSocket;
-module.exports.ScratchLinkWebSocket = AluxLabsLinkWebSocket; // 임시 alias
-```
-
-**옵션 B — 새 이름으로만 export (clean break):**
+변경 (clean break — 우리 측 코드는 옛 이름 없이 새 이름만 사용):
 ```js
 class AluxLabsLinkWebSocket { /* ... */ }
 module.exports = AluxLabsLinkWebSocket;
@@ -75,7 +66,6 @@ module.exports = AluxLabsLinkWebSocket;
 Safari 확장이 페이지에 주입하는 script 노드 ID 와 노출하는 전역 클래스 이름을 함께 변경:
 
 - 주입 스크립트가 등록하는 클래스: `window.ScratchLinkSafariSocket` → `window.AluxLabsLinkSafariSocket`
-- (또는 위 옵션 A 처럼 양쪽 등록)
 - 주입 노드 식별자: `scratch-link-extension-script` → `aluxlabs-link-extension-script`
 
 ### 3.3 선택 — Scratch 컨테이너 객체 통합
@@ -92,7 +82,7 @@ playground 예시는 `self.AluxLabs.BLE`, `self.AluxLabs.BT` 만 사용하도록
 
 - **JSON-RPC 2.0 메서드 이름** — `discover`, `connect`, `read`, `write`, `send`, `getVersion`, `pingMe`, `didDiscoverPeripheral`, `didReceiveMessage` 등. 와이어 프로토콜 변경 없음.
 - **WebSocket 엔드포인트 경로** — `/scratch/ble`, `/scratch/bt` 그대로. 클라이언트 코드 수정 불필요.
-- **NetworkProtocol 버전 번호** — 변경 없음 (현재 `1.3`).
+- **NetworkProtocol 버전** — 현재 `1.4`. (1.3→1.4에서 `getVersion` 응답에 `app` 필드가 추가됐고, 메서드·엔드포인트는 호환 유지.)
 - **npm 패키지명** — 우리 측에서 scratch-vm 을 참조할 때 `./node_modules/scratch-vm/...` 경로를 그대로 사용. 패키지명 자체는 외부 의존성이므로 scratch-vm 측 결정 사항.
 
 ## 5. 우리 측 적용 위치 (참고)
@@ -105,15 +95,6 @@ playground 예시는 `self.AluxLabs.BLE`, `self.AluxLabs.BT` 만 사용하도록
 
 서버 측 (C# / .NET) 은 JSON-RPC 와 WebSocket 경로만 의존하므로 본 변경의 영향 없음.
 
-## 6. 단기 호환이 필요한 경우 — 클라이언트 측 alias
+## 6. 적용 상태
 
-scratch-vm 측 수정이 완료될 때까지 임시로 양쪽 식별자를 함께 인식하려면 클라이언트 페이지에서:
-
-```js
-// 임시 호환 — scratch-vm 측이 정식 변경하면 제거
-self.AluxLabs = self.AluxLabs || self.Scratch || {};
-window.AluxLabsLinkWebSocket = window.AluxLabsLinkWebSocket || window.ScratchLinkWebSocket;
-window.AluxLabsLinkSafariSocket = window.AluxLabsLinkSafariSocket || window.ScratchLinkSafariSocket;
-```
-
-scratch-vm 측이 새 이름으로 정식 export 하면 위 호환 코드는 삭제.
+우리 측(`global.d.ts`, `playground.js`, `playground.html`, Safari 확장)은 **옛 식별자 없이 새 이름만 사용**하도록 이미 전환 완료(clean break). 옛 이름은 코드/문서 어디에도 남아있지 않다. (서버 측 C#/.NET은 JSON-RPC·WebSocket 경로만 의존하므로 영향 없음.)

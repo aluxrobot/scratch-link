@@ -404,21 +404,17 @@ Sent when the connection is lost (external cause, not client-initiated).
 ```
 
 **Disconnect Reasons:**
-- `"device"` — Device physically disconnected or a read-side `IOException` occurred (cable unplug, USB stack hiccup, driver error, transient USB noise that the kernel surfaced as an I/O error)
-- `"error"` — Unexpected non-I/O exception in the read loop
-- `"user"` — User action (rare)
-- `"shutdown"` — Application shutting down
+- `"device"` — Device disconnected. Triggered by any of: physical USB removal detected via a WMI device-removal watcher (fires even when the read loop is idle at `BytesToRead == 0`), a write-side `IOException` (client write or keep-alive resend), or a read-loop `IOException` / external port close.
+- `"error"` — Unexpected non-I/O exception in the read loop.
 
-**Recovery policy (current):**
+**Detection & recovery policy:**
 
-AluxLabs Link does **not** retry on I/O errors. The moment the kernel surfaces a read-side `IOException`, Link:
-1. Fires `serialDidDisconnect` with `reason: "device"`.
-2. Closes the port.
-3. Stops the keep-alive timer and the RX loop.
+AluxLabs Link **actively** detects disconnects through three independent paths, with a single-notification guard so exactly one `serialDidDisconnect` fires:
+1. **WMI removal watcher** — watches the connected device's PnP id for `__InstanceDeletionEvent`; catches a physical unplug even when the RX loop is blocked.
+2. **Write-side `IOException`** — a failed client write or keep-alive resend escalates to disconnect.
+3. **Read-loop exception** — `IOException`, or an external-close `InvalidOperationException` on the RX path.
 
-The client (aluxlabs) is responsible for any reconnect logic — including any debounce or retry policy for transient USB noise.
-
-This is a deliberate design choice for v1: keep Link's transport thin and predictable, let the client decide policy. If transient-disconnect reports start to accumulate from the field, we can re-negotiate a Link-side retry (e.g. one 200 ms re-open before surfacing the disconnect) and add a `retryOnIoError` connect parameter to opt in. Until then, **assume immediate disconnect on any I/O error.**
+On any of these, Link fires `serialDidDisconnect`, closes the port, and stops the keep-alive timer and RX loop. Link does **not** retry — the client (aluxlabs) owns any reconnect/debounce policy.
 
 ---
 

@@ -75,7 +75,7 @@ VS 상단 툴바에서:
 |---|---|---|---|
 | **일상 개발/디버깅 (F5)** | `aluxlabs-link-win` | `Debug_Win` / `x64` | 언패키지 EXE 직접 실행 |
 | **MSIX 패키지 빌드** | `aluxlabs-link-win-msix` | `Release_Win` / `x64` | publish profile (`win-x64.pubxml`)로 MSIX 생성 |
-| **배포용 msixbundle** | `aluxlabs-link-win-msix` | `Release_Win`, 전 플랫폼 | x86/x64/ARM64 `.msixbundle` 생성 |
+| **배포용 msixbundle** | `aluxlabs-link-win-msix` | `Release_Win` (x86\|x64) | x86/x64 self-contained `.msixbundle` 생성 (arm64 제외) |
 
 ## 6. 알려진 이슈
 
