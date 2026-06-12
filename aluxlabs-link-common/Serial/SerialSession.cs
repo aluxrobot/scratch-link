@@ -40,6 +40,9 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     private Timer keepAliveTimer;
     private bool keepAliveActive;
 
+    // [DEBUG-KA] temporary keep-alive diagnostics state — remove before commit (CLAUDE.md §4).
+    private bool kaSilentLogged;
+
     // 64-bit timestamps in DateTime.UtcNow.Ticks; accessed via Interlocked to keep reads/writes atomic on 32-bit runtimes.
     private long lastClientTxTicks;
     private long lastKeepAliveSentTicks;
@@ -333,11 +336,19 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         }
 
         var encoded = EncodingHelpers.EncodeBuffer(data, "base64");
+
+        // [DEBUG-RX] measure forwarding latency to catch WebSocket/send back-pressure — remove before commit (CLAUDE.md §4).
+        var sw = Stopwatch.StartNew();
         await this.SendNotification("serialDidReceiveData", new SerialDataReceived
         {
             Encoding = "base64",
             Message = encoded,
         });
+        sw.Stop();
+        if (sw.ElapsedMilliseconds >= 50)
+        {
+            Debug.WriteLine($"[DEBUG-RX] {DateTime.Now:HH:mm:ss.fff} serialDidReceiveData send took {sw.ElapsedMilliseconds}ms ({data.Length}B)");
+        }
     }
 
     /// <summary>
@@ -557,8 +568,17 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         if (data == null || data.Length == 0 || !this.IsConnected)
         {
+            // [DEBUG-KA] keep-alive ticking but nothing to resend — log once per stall. Remove before commit.
+            if (!this.kaSilentLogged)
+            {
+                Debug.WriteLine($"[DEBUG-KA] {DateTime.Now:HH:mm:ss.fff} tick, no resend (data={(data == null ? "null" : data.Length + "B")}, connected={this.IsConnected})");
+                this.kaSilentLogged = true;
+            }
+
             return;
         }
+
+        this.kaSilentLogged = false;
 
         // Hold off while a client write OR a prior keep-alive landed within the interval: normal write bursts keep this
         // silent, and counting a resend as TX means one forced send resets the budget instead of unlocking the raw tick cadence.
@@ -592,6 +612,9 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
             await this.DoWrite(data).ConfigureAwait(false);
             Interlocked.Exchange(ref this.lastKeepAliveSentTicks, DateTime.UtcNow.Ticks);
+
+            // [DEBUG-KA] confirm each keep-alive packet actually reached hardware, with the idle gap. Remove before commit.
+            Debug.WriteLine($"[DEBUG-KA] {DateTime.Now:HH:mm:ss.fff} resend {data.Length}B to hardware (idle {msSinceAnyTx}ms)");
         }
         catch (ObjectDisposedException)
         {
