@@ -91,7 +91,7 @@ VS 상단 툴바에서:
 
 ## 7. 참고
 
-- [`aluxlabs-link-win/aluxlabs-link-win.csproj`](../aluxlabs-link-win/aluxlabs-link-win.csproj) — 본체 프로젝트 설정
-- [`aluxlabs-link-win-msix/aluxlabs-link-win-msix.wapproj`](../aluxlabs-link-win-msix/aluxlabs-link-win-msix.wapproj) — MSIX 패키징 설정
-- [`SharedProps/WindowsSDK.props`](../SharedProps/WindowsSDK.props) — Windows App SDK 버전 핀
-- [`SharedProps/ScratchVersion.targets`](../SharedProps/ScratchVersion.targets) — 버전 자동 생성 로직
+- [`aluxlabs-link-win/aluxlabs-link-win.csproj`](../../aluxlabs-link-win/aluxlabs-link-win.csproj) — 본체 프로젝트 설정
+- [`aluxlabs-link-win-msix/aluxlabs-link-win-msix.wapproj`](../../aluxlabs-link-win-msix/aluxlabs-link-win-msix.wapproj) — MSIX 패키징 설정
+- [`SharedProps/WindowsSDK.props`](../../SharedProps/WindowsSDK.props) — Windows App SDK 버전 핀
+- [`SharedProps/ScratchVersion.targets`](../../SharedProps/ScratchVersion.targets) — 버전 자동 생성 로직
