@@ -8,6 +8,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reflection;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -33,7 +34,7 @@ public class Session : IDisposable
     /// Specifies the AluxLabs Link network protocol version. Note that this is not the application version.
     /// Keep this in sync with the version number in `NetworkProtocol.md`.
     /// </summary>
-    protected const string NetworkProtocolVersion = "1.3";
+    protected const string NetworkProtocolVersion = "1.4";
 
     /// <summary>
     /// Default timeout for remote requests.
@@ -140,12 +141,16 @@ public class Session : IDisposable
     /// </summary>
     /// <param name="methodName">The name of the method called (expected: "getVersion").</param>
     /// <param name="args">Any arguments passed to the method by the caller (expected: none).</param>
-    /// <returns>A string representing the protocol version.</returns>
+    /// <returns>An object carrying the network protocol version and the application version.</returns>
     protected static Task<object> HandleGetVersion(string methodName, JsonElement? args)
     {
+        var app = Assembly.GetEntryAssembly()?
+            .GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version;
+
         return Task.FromResult<object>(new Dictionary<string, string>
         {
             { "protocol", NetworkProtocolVersion },
+            { "app", app ?? "unknown" },
         });
     }
 

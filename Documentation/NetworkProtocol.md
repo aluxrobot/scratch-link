@@ -17,6 +17,8 @@ This version number shall follow the Semantic Versioning specification, found he
 
 ### Version History
 
+- Version 1.4:
+  - Add `app` (application version) property to the `getVersion` response.
 - Version 1.3:
   - Bluetooth LE:
     - Alter AluxLabs Link's handling of the `withResponse` flag on a `write` request. The flag now overrides Scratch
@@ -77,12 +79,14 @@ JSON-RPC **response** sent from AluxLabs Link to Scratch Extension .
   "jsonrpc": "2.0",   // JSON-RPC version indicator
   "id": 1,            // Message sequence identifier
   "result": {
-    "protocol": "1.2" // Version number for the overall network protocol
+    "protocol": "1.4",     // Version number for the overall network protocol
+    "app": "1.1.1.1037"    // AluxLabs Link application version (Major.Minor.Patch.Build)
   }
 }
 ```
 
 The version number in the `protocol` property corresponds to the network protocol version defined in this document.
+The `app` property carries the AluxLabs Link application version (*added in network protocol version 1.4*).
 Other properties may be present and may contain more version information about the particular session; see
 protocol-specific documentation for details.
 
