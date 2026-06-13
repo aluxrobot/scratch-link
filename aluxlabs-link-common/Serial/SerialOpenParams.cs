@@ -41,11 +41,18 @@ internal class SerialOpenParams
     public string PeripheralType { get; set; }
 
     /// <summary>
-    /// Gets or sets the keep-alive interval in milliseconds. If positive, the most recently
-    /// sent TX packet is automatically re-sent at this interval while the line is idle.
-    /// Null or non-positive disables the timer.
+    /// Gets or sets the keep-alive timer interval in milliseconds. With <see cref="KeepAlivePayload"/> set,
+    /// the payload is sent every interval (the client-chosen send cadence); otherwise the most recently sent
+    /// TX packet is resent once the line has been idle this long. Null or non-positive disables the timer.
     /// </summary>
     public int? KeepAliveIntervalMs { get; set; }
+
+    /// <summary>
+    /// Gets or sets an opaque keep-alive payload. When non-null, the keep-alive timer sends this payload every
+    /// <see cref="KeepAliveIntervalMs"/> regardless of client writes, instead of resending the last TX packet.
+    /// Lets a client own the device's keep-alive feed (packet and cadence) independently of its own send timing.
+    /// </summary>
+    public byte[] KeepAlivePayload { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether wire-level TX/RX hex dumps are emitted via

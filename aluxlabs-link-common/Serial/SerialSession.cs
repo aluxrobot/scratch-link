@@ -37,11 +37,9 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     private readonly object stateLock = new object();
 
     private byte[] lastSentData;
+    private byte[] keepAlivePayload;
     private Timer keepAliveTimer;
     private bool keepAliveActive;
-
-    // [DEBUG-KA] temporary keep-alive diagnostics state — remove before commit (CLAUDE.md §4).
-    private bool kaSilentLogged;
 
     // 64-bit timestamps in DateTime.UtcNow.Ticks; accessed via Interlocked to keep reads/writes atomic on 32-bit runtimes.
     private long lastClientTxTicks;
@@ -147,6 +145,12 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         if (this.wireTrace)
         {
             Trace.WriteLine("wire-trace: enabled for this session");
+        }
+
+        // Store before the platform DoConnect starts the keep-alive timer so the first tick already sees it.
+        lock (this.stateLock)
+        {
+            this.keepAlivePayload = openParams.KeepAlivePayload;
         }
 
         return this.DoConnect(port, openParams);
@@ -273,6 +277,17 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             {
                 requested = prop.Value.GetInt32();
             }
+
+            // Only replace the payload when explicitly supplied; absent leaves the cached one intact across toggles.
+            var payloadProp = args.Value.TryGetProperty("keepAlivePayload");
+            if (payloadProp.HasValue && payloadProp.Value.ValueKind != JsonValueKind.Null)
+            {
+                var payload = DecodeKeepAlivePayload(payloadProp.Value.GetString());
+                lock (this.stateLock)
+                {
+                    this.keepAlivePayload = payload;
+                }
+            }
         }
 
         // Stop-then-start makes the call idempotent regardless of current state.
@@ -337,18 +352,11 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         var encoded = EncodingHelpers.EncodeBuffer(data, "base64");
 
-        // [DEBUG-RX] measure forwarding latency to catch WebSocket/send back-pressure — remove before commit (CLAUDE.md §4).
-        var sw = Stopwatch.StartNew();
         await this.SendNotification("serialDidReceiveData", new SerialDataReceived
         {
             Encoding = "base64",
             Message = encoded,
         });
-        sw.Stop();
-        if (sw.ElapsedMilliseconds >= 50)
-        {
-            Debug.WriteLine($"[DEBUG-RX] {DateTime.Now:HH:mm:ss.fff} serialDidReceiveData send took {sw.ElapsedMilliseconds}ms ({data.Length}B)");
-        }
     }
 
     /// <summary>
@@ -519,8 +527,31 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             FlowControl = args?.TryGetProperty("flowControl")?.GetString() ?? "none",
             PeripheralType = args?.TryGetProperty("peripheralType")?.GetString(),
             KeepAliveIntervalMs = args?.TryGetProperty("keepAliveIntervalMs")?.GetInt32(),
+            KeepAlivePayload = ParseKeepAlivePayload(args),
             WireTrace = args?.TryGetProperty("wireTrace")?.GetBoolean() ?? false,
         };
+    }
+
+    private static byte[] ParseKeepAlivePayload(JsonElement? args)
+    {
+        return DecodeKeepAlivePayload(args?.TryGetProperty("keepAlivePayload")?.GetString());
+    }
+
+    private static byte[] DecodeKeepAlivePayload(string base64)
+    {
+        if (string.IsNullOrEmpty(base64))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Convert.FromBase64String(base64);
+        }
+        catch (FormatException)
+        {
+            throw JsonRpc2Error.InvalidParams("keepAlivePayload must be base64-encoded").ToException();
+        }
     }
 
     /// <summary>
@@ -556,6 +587,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     private async void OnKeepAliveTick(object state)
     {
         byte[] data;
+        bool payloadMode;
         lock (this.stateLock)
         {
             if (!this.keepAliveActive)
@@ -563,33 +595,25 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
                 return;
             }
 
-            data = this.lastSentData;
+            payloadMode = this.keepAlivePayload != null;
+            data = payloadMode ? this.keepAlivePayload : this.lastSentData;
         }
 
         if (data == null || data.Length == 0 || !this.IsConnected)
         {
-            // [DEBUG-KA] keep-alive ticking but nothing to resend — log once per stall. Remove before commit.
-            if (!this.kaSilentLogged)
-            {
-                Debug.WriteLine($"[DEBUG-KA] {DateTime.Now:HH:mm:ss.fff} tick, no resend (data={(data == null ? "null" : data.Length + "B")}, connected={this.IsConnected})");
-                this.kaSilentLogged = true;
-            }
-
             return;
         }
 
-        this.kaSilentLogged = false;
-
-        // Hold off while a client write OR a prior keep-alive landed within the interval: normal write bursts keep this
-        // silent, and counting a resend as TX means one forced send resets the budget instead of unlocking the raw tick cadence.
-        var nowTicks = DateTime.UtcNow.Ticks;
-        var msSinceClientTx = (nowTicks - Interlocked.Read(ref this.lastClientTxTicks)) / TimeSpan.TicksPerMillisecond;
-        var msSinceKeepAlive = (nowTicks - Interlocked.Read(ref this.lastKeepAliveSentTicks)) / TimeSpan.TicksPerMillisecond;
-        var msSinceAnyTx = Math.Min(msSinceClientTx, msSinceKeepAlive);
-
-        if (msSinceAnyTx < KeepAliveFeedIntervalMs)
+        // Payload mode is ungated: its timer interval is itself the client-configured send cadence.
+        if (!payloadMode)
         {
-            return;
+            var nowTicks = DateTime.UtcNow.Ticks;
+            var msSinceClientTx = (nowTicks - Interlocked.Read(ref this.lastClientTxTicks)) / TimeSpan.TicksPerMillisecond;
+            var msSinceKeepAlive = (nowTicks - Interlocked.Read(ref this.lastKeepAliveSentTicks)) / TimeSpan.TicksPerMillisecond;
+            if (Math.Min(msSinceClientTx, msSinceKeepAlive) < KeepAliveFeedIntervalMs)
+            {
+                return;
+            }
         }
 
         // WaitAsync(0) makes the tick idle-only: during a write burst the semaphore is busy and we no-op.
@@ -612,9 +636,6 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
             await this.DoWrite(data).ConfigureAwait(false);
             Interlocked.Exchange(ref this.lastKeepAliveSentTicks, DateTime.UtcNow.Ticks);
-
-            // [DEBUG-KA] confirm each keep-alive packet actually reached hardware, with the idle gap. Remove before commit.
-            Debug.WriteLine($"[DEBUG-KA] {DateTime.Now:HH:mm:ss.fff} resend {data.Length}B to hardware (idle {msSinceAnyTx}ms)");
         }
         catch (ObjectDisposedException)
         {

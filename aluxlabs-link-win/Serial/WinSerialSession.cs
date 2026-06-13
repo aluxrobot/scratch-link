@@ -245,10 +245,6 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
     {
         var buf = new byte[4096];
 
-        // [DEBUG-RX] temporary RX-gap diagnostics — remove before commit (CLAUDE.md §4).
-        var lastRxTicks = DateTime.UtcNow.Ticks;
-        var stallReported = false;
-
         while (!ct.IsCancellationRequested)
         {
             var currentPort = this.port;
@@ -291,14 +287,6 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 
             if (available <= 0)
             {
-                // [DEBUG-RX] flag a persistent stall (device stopped sending GET_CTRL) once per gap — remove before commit.
-                var idleMs = (DateTime.UtcNow.Ticks - lastRxTicks) / TimeSpan.TicksPerMillisecond;
-                if (idleMs >= 1000 && !stallReported)
-                {
-                    Debug.WriteLine($"[DEBUG-RX-STALL] {DateTime.Now:HH:mm:ss.fff} no RX for {idleMs}ms (still waiting)");
-                    stallReported = true;
-                }
-
                 // Wait on ct.WaitHandle so cancellation wakes the loop immediately; otherwise sleep 10ms.
                 try
                 {
@@ -371,14 +359,6 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             {
                 continue;
             }
-
-            // [DEBUG-RX] log every RX chunk with the gap since the previous one — remove before commit.
-            var nowTicks = DateTime.UtcNow.Ticks;
-            var gapMs = (nowTicks - lastRxTicks) / TimeSpan.TicksPerMillisecond;
-            lastRxTicks = nowTicks;
-            stallReported = false;
-            var rxMarker = gapMs >= 1000 ? "[DEBUG-RX-STALL]" : "[DEBUG-RX]";
-            Debug.WriteLine($"{rxMarker} {DateTime.Now:HH:mm:ss.fff} +{gapMs}ms {n}B");
 
             var data = new byte[n];
             Buffer.BlockCopy(buf, 0, data, 0, n);

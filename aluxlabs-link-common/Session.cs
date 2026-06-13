@@ -98,16 +98,7 @@ public class Session : IDisposable
 
         this.webSocket.OnClose = () =>
         {
-            // [DEBUG-WS] timestamp the WS close so it lines up with [DEBUG-RX]/[DEBUG-KA] — remove before commit (CLAUDE.md §4).
-            Debug.WriteLine($"[DEBUG-WS] {DateTime.Now:HH:mm:ss.fff} OnClose");
             runCompletion.TrySetResult(true);
-        };
-
-        // [DEBUG-WS] Fleck raises OnError before OnClose on an abnormal drop (TCP reset / client vanished); a clean close fires
-        // OnClose only. Previously unregistered, so that signal was lost. Remove before commit (CLAUDE.md §4).
-        this.webSocket.OnError = e =>
-        {
-            Debug.WriteLine($"[DEBUG-WS] {DateTime.Now:HH:mm:ss.fff} OnError {e?.GetType().Name}: {e?.Message}");
         };
         this.webSocket.OnMessage = async messageString =>
         {
