@@ -54,7 +54,7 @@ public class AluxLabsLinkApp
     /// </summary>
     public void Run()
     {
-        this.webSocketListener.Start(string.Format("http://0.0.0.0:{0}/", WebSocketPort));
+        this.webSocketListener.Start(string.Format("http://[::0]:{0}/", WebSocketPort));
     }
 
     /// <summary>
