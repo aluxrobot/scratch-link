@@ -6,6 +6,6 @@ Bump with `make set-version VERSION=x.y.z` (avoid hand-editing).
 -->
 <Project>
   <PropertyGroup>
-    <ReleaseTriplet>1.1.1</ReleaseTriplet>
+    <ReleaseTriplet>1.1.2</ReleaseTriplet>
   </PropertyGroup>
 </Project>
