@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Ports;
+using System.Management;
 using System.Threading;
 using System.Threading.Tasks;
 using Fleck;
@@ -28,6 +29,9 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
     private SerialPort port;
     private CancellationTokenSource rxCts;
     private Task rxLoop;
+    private ManagementEventWatcher removalWatcher;
+    private string connectedPnpDeviceId;
+    private int disconnectNotified;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="WinSerialSession"/> class.
@@ -100,11 +104,14 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             throw JsonRpc2Error.ApplicationError($"could not open serial port {info.Path}: {e.Message}").ToException();
         }
 
+        Interlocked.Exchange(ref this.disconnectNotified, 0);
+
         this.rxCts = new CancellationTokenSource();
         var token = this.rxCts.Token;
         this.rxLoop = Task.Run(() => this.ReadLoop(token));
 
-        this.StartKeepAlive(openParams.KeepAliveIntervalMs);
+        this.StartKeepAlive();
+        this.StartRemovalWatcher(info.PnpDeviceId);
 
         return Task.FromResult<object>(new Dictionary<string, object>());
     }
@@ -145,6 +152,8 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
         catch (IOException e)
         {
+            // A write IOException means the device vanished; escalate so the idle keep-alive resend surfaces removal fast.
+            this.HandleSurpriseRemoval("device", e.Message);
             throw JsonRpc2Error.InternalError($"write failed: {e.Message}").ToException();
         }
 
@@ -154,7 +163,10 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
     /// <inheritdoc/>
     protected override async Task DoDisconnect()
     {
+        // Mark notified first: a client-initiated disconnect must not emit serialDidDisconnect, even if a removal races in.
+        Interlocked.Exchange(ref this.disconnectNotified, 1);
         this.StopKeepAlive();
+        this.StopRemovalWatcher();
         var loop = this.rxLoop;
         this.CloseConnectionSilently();
 
@@ -196,6 +208,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
+        this.StopRemovalWatcher();
         this.CloseConnectionSilently();
     }
 
@@ -253,6 +266,12 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             }
             catch (InvalidOperationException)
             {
+                // "Port closed" without a cancellation request means an external close (surprise removal), not our teardown.
+                if (!ct.IsCancellationRequested)
+                {
+                    this.HandleSurpriseRemoval("device", "serial port closed unexpectedly");
+                }
+
                 break;
             }
             catch (IOException) when (ct.IsCancellationRequested)
@@ -262,8 +281,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             catch (IOException e)
             {
                 Trace.WriteLine($"Serial BytesToRead IOException on {currentPort.PortName}: {e.Message}");
-                _ = this.DidDisconnect("device", e.Message);
-                this.CloseConnectionSilently();
+                this.HandleSurpriseRemoval("device", e.Message);
                 break;
             }
 
@@ -314,8 +332,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             catch (IOException e)
             {
                 Trace.WriteLine($"Serial read IOException on {currentPort.PortName}: {e.Message}");
-                _ = this.DidDisconnect("device", e.Message);
-                this.CloseConnectionSilently();
+                this.HandleSurpriseRemoval("device", e.Message);
                 break;
             }
             catch (ObjectDisposedException)
@@ -324,13 +341,17 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             }
             catch (InvalidOperationException)
             {
+                if (!ct.IsCancellationRequested)
+                {
+                    this.HandleSurpriseRemoval("device", "serial port closed unexpectedly");
+                }
+
                 break;
             }
             catch (Exception e)
             {
                 Trace.WriteLine($"Unexpected serial read error: {e}");
-                _ = this.DidDisconnect("error", e.Message);
-                this.CloseConnectionSilently();
+                this.HandleSurpriseRemoval("error", e.Message);
                 break;
             }
 
@@ -389,6 +410,108 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         try
         {
             localCts?.Dispose();
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private void StartRemovalWatcher(string pnpDeviceId)
+    {
+        if (string.IsNullOrEmpty(pnpDeviceId))
+        {
+            return;
+        }
+
+        try
+        {
+            this.connectedPnpDeviceId = pnpDeviceId;
+            var query = new WqlEventQuery(
+                "__InstanceDeletionEvent",
+                TimeSpan.FromSeconds(1),
+                "TargetInstance ISA 'Win32_PnPEntity'");
+            this.removalWatcher = new ManagementEventWatcher(query);
+            this.removalWatcher.EventArrived += this.OnDeviceRemoved;
+            this.removalWatcher.Start();
+        }
+        catch (Exception e)
+        {
+            // Read-loop exceptions and keep-alive write failures remain as backup detection.
+            Trace.WriteLine($"Failed to start USB removal watcher for {pnpDeviceId}: {e.Message}");
+        }
+    }
+
+    private void OnDeviceRemoved(object sender, EventArrivedEventArgs e)
+    {
+        try
+        {
+            var target = e.NewEvent?["TargetInstance"] as ManagementBaseObject;
+            var removedId = target?["PNPDeviceID"] as string;
+            if (!this.IsConnectedDevice(removedId))
+            {
+                return;
+            }
+
+            Trace.WriteLine($"USB surprise removal detected: {removedId}");
+            this.HandleSurpriseRemoval("device", "USB device removed");
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"Error handling device removal event: {ex.Message}");
+        }
+    }
+
+    private bool IsConnectedDevice(string removedPnpId)
+    {
+        var mine = this.connectedPnpDeviceId;
+        if (string.IsNullOrEmpty(mine) || string.IsNullOrEmpty(removedPnpId))
+        {
+            return false;
+        }
+
+        // Exact node, or our device is a child of a removed parent (hub) node. Avoid broad VID/PID-only matching.
+        return mine.Equals(removedPnpId, StringComparison.OrdinalIgnoreCase)
+            || mine.StartsWith(removedPnpId + "\\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void HandleSurpriseRemoval(string reason, string message)
+    {
+        if (Interlocked.Exchange(ref this.disconnectNotified, 1) != 0)
+        {
+            return;
+        }
+
+        _ = this.DidDisconnect(reason, message);
+        this.CloseConnectionSilently();
+
+        // Stop off the WMI callback thread: ManagementEventWatcher.Stop can deadlock if called from EventArrived.
+        _ = Task.Run(() => this.StopRemovalWatcher());
+    }
+
+    private void StopRemovalWatcher()
+    {
+        var watcher = Interlocked.Exchange(ref this.removalWatcher, null);
+        this.connectedPnpDeviceId = null;
+
+        if (watcher == null)
+        {
+            return;
+        }
+
+        try
+        {
+            watcher.EventArrived -= this.OnDeviceRemoved;
+            watcher.Stop();
+        }
+        catch (Exception e)
+        {
+            Trace.WriteLine($"Error stopping USB removal watcher: {e.Message}");
+        }
+
+        try
+        {
+            watcher.Dispose();
         }
         catch
         {

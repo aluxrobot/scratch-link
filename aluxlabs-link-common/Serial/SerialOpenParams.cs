@@ -5,6 +5,8 @@
 
 namespace AluxLabs.Link.Serial;
 
+using System.Collections.Generic;
+
 /// <summary>
 /// Parameters extracted from a serial "connect" request.
 /// </summary>
@@ -41,11 +43,10 @@ internal class SerialOpenParams
     public string PeripheralType { get; set; }
 
     /// <summary>
-    /// Gets or sets the keep-alive interval in milliseconds. If positive, the most recently
-    /// sent TX packet is automatically re-sent at this interval while the line is idle.
-    /// Null or non-positive disables the timer.
+    /// Gets or sets the keep-alive entries the device requires. Each is an opaque packet sent on its own cadence,
+    /// independent of client writes. An empty or null list disables keep-alive. Payloads are written verbatim.
     /// </summary>
-    public int? KeepAliveIntervalMs { get; set; }
+    public IReadOnlyList<KeepAliveEntryParam> KeepAlive { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether wire-level TX/RX hex dumps are emitted via

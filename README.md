@@ -71,7 +71,7 @@ scratch-link/
 
 ## 개발 환경 구성
 
-[Documentation/Alux/WindowsDevSetup-VS2026.md](Documentation/Alux/WindowsDevSetup-VS2026.md) 참고.
+[docs/windows/WindowsDevSetup-VS2026.md](docs/windows/WindowsDevSetup-VS2026.md) 참고.
 
 ## 빌드 구성
 
