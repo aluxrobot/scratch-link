@@ -110,7 +110,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         var token = this.rxCts.Token;
         this.rxLoop = Task.Run(() => this.ReadLoop(token));
 
-        this.StartKeepAlive(openParams.KeepAliveIntervalMs);
+        this.StartKeepAlive();
         this.StartRemovalWatcher(info.PnpDeviceId);
 
         return Task.FromResult<object>(new Dictionary<string, object>());

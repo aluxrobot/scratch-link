@@ -117,7 +117,7 @@ Returns a one-shot snapshot of currently matching serial ports in the response (
 Opens a serial port connection.
 
 **Request:**
-```json
+```jsonc
 {
   "jsonrpc": "2.0",
   "id": 2,
@@ -130,7 +130,10 @@ Opens a serial port connection.
     "stopBits": "one",
     "flowControl": "none",
     "peripheralType": "codetinker",
-    "keepAliveIntervalMs": 33,
+    "keepAlive": [
+      { "id": "ping", "payload": "<base64 PING>",     "intervalMs": 300 },
+      { "id": "ctrl", "payload": "<base64 SET_CTRL>", "intervalMs": 300 }
+    ],
     "wireTrace": false
   }
 }
@@ -144,8 +147,13 @@ Opens a serial port connection.
 - `stopBits` (string, optional) — "one" | "onePointFive" | "two" (default: "one")
 - `flowControl` (string, optional) — "none" | "rtsCts" | "xonXoff" (default: "none")
 - `peripheralType` (string, optional) — Device type identifier ("codetinker", "connect", "technic", etc.)
-- `keepAliveIntervalMs` (int, optional) — Enables keep-alive and sets the **poll granularity** in ms (how often Link checks for an idle link). Omit or null to disable. **Recommended: 33ms for Codetinker.** The actual resend cadence is a fixed internal ~300ms idle interval, sized under the device's ~1s RX watchdog; a small poll value just hits that deadline more precisely.
+- `keepAlive` (array, optional) — The periodic packets the device requires to stay alive. Each entry is sent on its **own cadence**, independent of client writes. Omit or pass `[]` to disable keep-alive. See **keep-alive entry fields** below. A device may need more than one packet (e.g. Codetinker needs both a `ping` and a control-state `ctrl` packet); list each as its own entry so they are never coalesced into one write.
 - `wireTrace` (bool, optional) — Diagnostic. When `true`, Link emits per-write/per-read hex dumps via `Trace.WriteLine` (visible in DebugView or attached debugger). Off by default. Use only for transport-level debugging; the dumps include payload bytes and can be verbose.
+
+**Keep-alive entry fields:**
+- `id` (string, required) — Caller-assigned identifier, unique within the list. Used later to target this entry from `setKeepAlivePayload`.
+- `payload` (string, optional) — Bytes to send each tick, base64-encoded. Written to the serial line **verbatim** (no framing/validation — the payload's correctness is the client's responsibility). May be omitted/empty initially and supplied later via `setKeepAlivePayload`; an entry with no payload sends nothing until then.
+- `intervalMs` (int, required) — Send cadence in milliseconds. Must be positive. Choose well under the device's RX timeout (e.g. 300ms for Codetinker's ~1s firmware watchdog, to land ~3 sends per timeout window).
 
 **Response:**
 ```json
@@ -207,8 +215,7 @@ Sends data to the serial port.
 ```
 
 **Side Effects:**
-- Resets the keep-alive timer
-- Last sent packet is cached for keep-alive resend
+- None on keep-alive. A `write` is serialized against keep-alive sends (they share one write lock) but does not reset, cache for, or otherwise alter the keep-alive entries.
 
 ---
 
@@ -239,7 +246,7 @@ Enables data reception (usually implicit after connect).
 
 ### stopReading
 
-Disables data reception (keep-alive timer continues running).
+Disables data reception (keep-alive timers continue running).
 
 **Request:**
 ```json
@@ -264,9 +271,9 @@ Disables data reception (keep-alive timer continues running).
 
 ### setKeepAlive
 
-Toggle or reconfigure keep-alive at runtime, without disconnecting. Use to disable keep-alive before a firmware update and re-enable it afterwards, or to change the interval mid-session.
+Toggle the **whole keep-alive timer set** on or off at runtime, without disconnecting. Use to pause keep-alive before a firmware update and resume it afterwards. This does **not** define the entries or their cadence — those come from `connect`'s `keepAlive` list; `setKeepAlive` only starts/stops them as a group.
 
-**Request — disable:**
+**Request — pause (stop all entry timers):**
 ```json
 {
   "jsonrpc": "2.0",
@@ -276,45 +283,68 @@ Toggle or reconfigure keep-alive at runtime, without disconnecting. Use to disab
 }
 ```
 
-**Request — enable / change interval:**
+**Request — resume (restart every configured entry on its own cadence):**
 ```json
 {
   "jsonrpc": "2.0",
   "id": 7,
   "method": "setKeepAlive",
-  "params": { "intervalMs": 33 }
+  "params": { "intervalMs": 1 }
 }
 ```
 
 **Parameters:**
-- `intervalMs` (int or null, required) — Interval in milliseconds. `null`, `0`, or negative values **disable** keep-alive. Positive values (re)start it with the given interval.
+- `intervalMs` (int or null, required) — Toggle signal only. `null`, `0`, or negative **pauses** all entry timers. Any positive value **resumes** them; each entry runs at its own per-entry `intervalMs` from `connect`, so this number's magnitude is not used as a cadence.
 
 **Response:**
 ```json
 {
   "jsonrpc": "2.0",
   "id": 7,
-  "result": { "intervalMs": 33 }
+  "result": { "intervalMs": 1 }
 }
 ```
 
-The `result.intervalMs` echoes the **applied** interval (`null` when disabled). Use this to confirm the operation took effect.
+The `result.intervalMs` echoes the **applied** toggle value (`null` when paused). Use this to confirm the operation took effect.
 
 **Side Effects:**
-- If keep-alive was already running, the existing timer is stopped (blocking on any in-flight tick) before the new one starts. The call is fully idempotent.
-- The cached last-TX packet is **preserved** across the toggle, so re-enabling keep-alive immediately resumes resending the same packet.
+- Stop-then-start: any running entry timers are stopped (blocking on in-flight ticks) before resuming. Fully idempotent.
+- The configured entries and their payloads are **preserved** across the toggle, so resume restarts the same set. To change a payload use `setKeepAlivePayload`.
 
-**Typical DFU sequence (client-side):**
-```javascript
-// 1. Disable keep-alive before bootloader entry
-await link.send("setKeepAlive", { intervalMs: null });
+---
 
-// 2. Run firmware update (writes/reads as usual)
-await runDfu(...);
+### setKeepAlivePayload
 
-// 3. Re-enable keep-alive for normal operation
-await link.send("setKeepAlive", { intervalMs: 33 });
+Replace the payload of one configured keep-alive entry at runtime, so a **dynamic** packet (e.g. the current control state) stays current. The cadence is unchanged; the next tick sends the new bytes.
+
+**Request:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "setKeepAlivePayload",
+  "params": { "id": "ctrl", "payload": "ESIzRFU=" }
+}
 ```
+
+**Parameters:**
+- `id` (string, required) — The entry id from `connect`'s `keepAlive` list.
+- `payload` (string, optional) — New bytes for that entry, base64-encoded. Sent verbatim from the next tick onward. Omit/empty to clear the entry's payload (it then sends nothing until set again).
+
+**Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "result": { "id": "ctrl", "applied": true }
+}
+```
+
+- `result.applied` is `true` when `id` matched a configured entry, `false` otherwise. An unknown `id` is a no-op (no error), leaving every entry untouched.
+
+**Errors:**
+- Missing/empty `id` → -32602.
+- Malformed (non-base64) `payload` → -32602.
 
 ---
 
@@ -342,7 +372,7 @@ Closes the serial port connection.
 ```
 
 **Side Effects:**
-- Stops the keep-alive timer
+- Stops all keep-alive timers
 - Closes the port
 - Does NOT fire `serialDidDisconnect` notification (client-initiated close)
 
@@ -404,17 +434,17 @@ Sent when the connection is lost (external cause, not client-initiated).
 ```
 
 **Disconnect Reasons:**
-- `"device"` — Device disconnected. Triggered by any of: physical USB removal detected via a WMI device-removal watcher (fires even when the read loop is idle at `BytesToRead == 0`), a write-side `IOException` (client write or keep-alive resend), or a read-loop `IOException` / external port close.
+- `"device"` — Device disconnected. Triggered by any of: physical USB removal detected via a WMI device-removal watcher (fires even when the read loop is idle at `BytesToRead == 0`), a write-side `IOException` (client write or keep-alive send), or a read-loop `IOException` / external port close.
 - `"error"` — Unexpected non-I/O exception in the read loop.
 
 **Detection & recovery policy:**
 
 AluxLabs Link **actively** detects disconnects through three independent paths, with a single-notification guard so exactly one `serialDidDisconnect` fires:
 1. **WMI removal watcher** — watches the connected device's PnP id for `__InstanceDeletionEvent`; catches a physical unplug even when the RX loop is blocked.
-2. **Write-side `IOException`** — a failed client write or keep-alive resend escalates to disconnect.
+2. **Write-side `IOException`** — a failed client write or keep-alive send escalates to disconnect.
 3. **Read-loop exception** — `IOException`, or an external-close `InvalidOperationException` on the RX path.
 
-On any of these, Link fires `serialDidDisconnect`, closes the port, and stops the keep-alive timer and RX loop. Link does **not** retry — the client (aluxlabs) owns any reconnect/debounce policy.
+On any of these, Link fires `serialDidDisconnect`, closes the port, and stops all keep-alive timers and the RX loop. Link does **not** retry — the client (aluxlabs) owns any reconnect/debounce policy.
 
 ---
 
@@ -430,7 +460,7 @@ On any of these, Link fires `serialDidDisconnect`, closes the port, and stops th
 }
 // → didDiscoverPeripheral: { peripheralId: "port-0", name: "COM7 (CH340)", ... }
 
-// 2. Connect with keep-alive
+// 2. Connect with keep-alive (one entry per periodic packet the device needs)
 {
   "jsonrpc": "2.0",
   "id": 2,
@@ -439,11 +469,14 @@ On any of these, Link fires `serialDidDisconnect`, closes the port, and stops th
     "peripheralId": "port-0",
     "baudRate": 115200,
     "peripheralType": "codetinker",
-    "keepAliveIntervalMs": 33
+    "keepAlive": [
+      { "id": "ping", "payload": "<base64 PING>",     "intervalMs": 300 },
+      { "id": "ctrl", "payload": "<base64 SET_CTRL>", "intervalMs": 300 }
+    ]
   }
 }
 // → result: {}
-// → Keep-alive starts; polls every 33ms and resends the last TX packet after ~300ms of TX-idle
+// → Each entry starts its own timer and sends its payload verbatim every 300ms
 
 // 3. Send command
 {
@@ -456,20 +489,30 @@ On any of these, Link fires `serialDidDisconnect`, closes the port, and stops th
   }
 }
 // → result: { sentBytes: 4 }
-// → Keep-alive idle budget reset (cached packet = AQIDBA==)
+// → Independent of keep-alive (shares the write lock only)
 
-// 4. Receive response
-// ← serialDidReceiveData: { message: "BwgJCg==", encoding: "base64" }
-
-// 5. Disconnect
+// 4. Update the dynamic control packet so idle keep-alive reflects the latest state
 {
   "jsonrpc": "2.0",
   "id": 4,
+  "method": "setKeepAlivePayload",
+  "params": { "id": "ctrl", "payload": "ESIzRFU=" }
+}
+// → result: { id: "ctrl", applied: true }
+// → The "ctrl" entry sends the new bytes from its next tick onward
+
+// 5. Receive response
+// ← serialDidReceiveData: { message: "BwgJCg==", encoding: "base64" }
+
+// 6. Disconnect
+{
+  "jsonrpc": "2.0",
+  "id": 5,
   "method": "disconnect",
   "params": {}
 }
 // → result: {}
-// → Keep-alive timer stops
+// → All keep-alive timers stop
 ```
 
 ---
@@ -491,11 +534,14 @@ The human-readable detail is in `error.data`; `error.message` is the category st
 ## Recommendations
 
 ### For Codetinker
-```json
+```jsonc
 {
   "baudRate": 115200,
   "peripheralType": "codetinker",
-  "keepAliveIntervalMs": 33
+  "keepAlive": [
+    { "id": "ping", "payload": "<base64 PING>",     "intervalMs": 300 },
+    { "id": "ctrl", "payload": "<base64 SET_CTRL>", "intervalMs": 300 }
+  ]
 }
 ```
 
@@ -508,15 +554,12 @@ The human-readable detail is in `error.data`; `error.message` is the category st
 
 ### For Firmware Updates
 
-Two layers of protection:
-
-1. **Automatic (no client change needed).** Each `write` refreshes the last-TX timestamp, so a burst of writes (DFU chunks) keeps the link below the ~300ms idle threshold and suppresses the resend until the line goes idle again.
-2. **Explicit (recommended for wireless DFU).** Before bootloader entry, call `setKeepAlive` with `intervalMs: null` to disable keep-alive entirely. Re-enable after DFU completes. This eliminates any chance of a resend racing with a bootloader handshake on a slow wireless link.
+Keep-alive entries fire on their own cadence **regardless of client writes** — there is no automatic idle-budget suppression. A keep-alive packet can therefore interleave between DFU chunks and corrupt the handshake. **Always pause keep-alive explicitly around a firmware update:** call `setKeepAlive` with `intervalMs: null` before bootloader entry, then resume after DFU completes.
 
 ```javascript
 await link.send("setKeepAlive", { intervalMs: null });
 // ... run DFU ...
-await link.send("setKeepAlive", { intervalMs: 33 });
+await link.send("setKeepAlive", { intervalMs: 1 });  // any positive value resumes the configured entries
 ```
 
 ### For Transport-Level Debugging
@@ -526,12 +569,13 @@ Enable `wireTrace: true` on `connect` to get per-write/per-read hex dumps via `T
 ```
 wire-trace TX 12B 4c 4f 41 44 ...
 wire-trace RX 31B 3c 1e af 00 ...
-wire-trace TX(keep-alive) 4B aa bb cc dd
+wire-trace TX(keep-alive:ping) 5B a6 6a 01 ff 0c
+wire-trace TX(keep-alive:ctrl) 19B 11 22 33 ...
 ```
 
 Buffers longer than 256 bytes are truncated with `…(+NB)` suffix. Compare these against the client's own per-message log to localize any drops or corruption.
 
 ---
 
-**API Version**: 1.2  
-**Last Updated**: 2026-06-08
+**API Version**: 1.4  
+**Last Updated**: 2026-06-15

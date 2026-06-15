@@ -19,6 +19,11 @@ This version number shall follow the Semantic Versioning specification, found he
 
 - Version 1.4:
   - Add `app` (application version) property to the `getVersion` response.
+  - Serial:
+    - Replace the single `keepAliveIntervalMs`/`keepAlivePayload` connect fields with a `keepAlive` list of
+      `{ id, payload, intervalMs }` entries, each sent verbatim on its own cadence.
+    - Add the `setKeepAlivePayload` request to replace one entry's payload at runtime.
+    - `setKeepAlive` now toggles the whole entry set on/off rather than configuring a single timer.
 - Version 1.3:
   - Bluetooth LE:
     - Alter AluxLabs Link's handling of the `withResponse` flag on a `write` request. The flag now overrides Scratch

@@ -2,37 +2,45 @@
 
 ## Overview
 
-AluxLabs Link's serial transport supports **keep-alive** functionality to prevent device timeout. This is particularly useful for devices like Codetinker that disconnect if no response is received within 1 second.
+AluxLabs Link's serial transport supports **keep-alive** to prevent device timeout. Some devices (e.g. Codetinker over CH340) stop responding unless the host keeps feeding them specific packets on a regular cadence.
+
+Keep-alive is a **client-declared contract**: on `connect` the client supplies a list of periodic packets, and Link sends each one verbatim on its own timer. Link is device-agnostic — it never inspects, frames, or generates payloads; it only delivers what the client declared, on schedule.
 
 ## Problem Statement
 
-Some hardware devices (e.g., Codetinker with CH340 USB-to-serial) require continuous communication:
-- If no packet is received for > 1 second, the device considers the connection lost
-- This triggers device-side notifications (e.g., buzzer sound)
-- Regular idle periods during normal operation cause unnecessary timeouts
+Some hardware needs more than one kind of periodic packet, each with its own watchdog:
+
+- A static **liveness** packet (e.g. Codetinker `PING`, 5 bytes) — keeps the RX/connection watchdog happy. Content never changes.
+- A dynamic **control** packet (e.g. Codetinker `SET_CTRL`, 19 bytes) — carries the current control state (motors, sensors, IMU). The device drops its output stream if it does not receive this within its RX timeout (~1s for Codetinker), and the content changes as control state changes.
+
+During idle periods the host's application layer has nothing to send, so without keep-alive these packets stop and the device times out. A single-packet keep-alive cannot cover a device that needs **two** distinct periodic packets — hence the list model.
 
 ## Solution
 
-The keep-alive mechanism automatically resends the **last transmitted (TX) packet** whenever the link has been TX-idle for a fixed internal feed interval (~300ms), sized well under the device's ~1s RX watchdog. This keeps the device "alive" without interfering with actual communication.
+The client declares one **keep-alive entry per periodic packet**. Each entry is `{ id, payload, intervalMs }`. Link runs an independent timer per entry and writes that entry's current payload to the serial line every `intervalMs`, verbatim.
 
-### Key Features
+### Key features
 
-✅ **Automatic resend** — Last sent packet is cached and resent after the link goes TX-idle  
-✅ **No interference with active communication** — Every client write (and every resend) restarts the idle budget, so frequent communication keeps keep-alive silent  
-✅ **Firmware update safe** — During firmware updates (DFU), frequent writes keep the link below the idle threshold so keep-alive never fires  
-✅ **Optional and configurable** — Can be enabled/disabled per connection  
+✅ **Multiple packets** — A device that needs N periodic packets gets N entries; they are never coalesced (avoids exceeding a transport's MTU and fragmenting).
+✅ **Per-entry cadence** — Each entry has its own `intervalMs`.
+✅ **Dynamic payloads** — A control packet can be refreshed at runtime via `setKeepAlivePayload` so the idle feed always reflects the latest state (no stale "snapshot" sent forever).
+✅ **Device-agnostic** — Payloads are opaque bytes; correctness is the client's responsibility.
+✅ **Pauseable** — The whole set can be toggled off/on with `setKeepAlive` (e.g. around a firmware update).
 
 ## Usage
 
-### Serial Connection Request
+### Connection request
 
-When connecting to a serial device, include the `keepAliveIntervalMs` parameter:
+List one entry per periodic packet the device needs. Payloads are base64-encoded:
 
-```json
+```jsonc
 {
   "baudRate": 115200,
   "peripheralType": "codetinker",
-  "keepAliveIntervalMs": 33
+  "keepAlive": [
+    { "id": "ping", "payload": "<base64 PING>",     "intervalMs": 300 },
+    { "id": "ctrl", "payload": "<base64 SET_CTRL>", "intervalMs": 300 }
+  ]
 }
 ```
 
@@ -40,18 +48,29 @@ When connecting to a serial device, include the `keepAliveIntervalMs` parameter:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `baudRate` | int | Yes | Baud rate (e.g., 115200) |
-| `peripheralType` | string | No | Device type identifier (e.g., "codetinker", "connect", "technic") |
-| `keepAliveIntervalMs` | int \| null | No | Enables keep-alive and sets the **poll granularity** in ms — how often Link checks whether the link went idle. `null`/omitted = disabled. Use 33ms for Codetinker. The actual resend cadence is a fixed internal ~300ms idle interval; a small poll value just hits that deadline more precisely. |
+| `baudRate` | int | Yes | Baud rate (e.g. 115200) |
+| `peripheralType` | string | No | Device type identifier (e.g. "codetinker") |
+| `keepAlive` | array | No | Periodic packets the device requires. Omit or `[]` = keep-alive disabled. |
+
+**Keep-alive entry:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | Yes | Unique id within the list; target for `setKeepAlivePayload`. |
+| `payload` | string | No | Base64 bytes sent each tick, verbatim. May be set later via `setKeepAlivePayload`; empty = sends nothing yet. |
+| `intervalMs` | int | Yes | Positive send cadence. Choose well under the device's RX timeout. |
 
 ### Examples
 
-#### Codetinker (with keep-alive)
-```json
+#### Codetinker (PING + SET_CTRL)
+```jsonc
 {
   "baudRate": 115200,
   "peripheralType": "codetinker",
-  "keepAliveIntervalMs": 33
+  "keepAlive": [
+    { "id": "ping", "payload": "<base64 PING>",     "intervalMs": 300 },
+    { "id": "ctrl", "payload": "<base64 SET_CTRL>", "intervalMs": 300 }
+  ]
 }
 ```
 
@@ -62,134 +81,114 @@ When connecting to a serial device, include the `keepAliveIntervalMs` parameter:
 }
 ```
 
-#### Other device with custom interval
-```json
+#### Single static packet
+```jsonc
 {
   "baudRate": 57600,
   "peripheralType": "custom",
-  "keepAliveIntervalMs": 100
+  "keepAlive": [
+    { "id": "heartbeat", "payload": "<base64>", "intervalMs": 100 }
+  ]
 }
 ```
 
-## How It Works
+## Choosing a cadence
 
-### 1. Keep-Alive Enabled (poll = 33ms, feed interval = 300ms)
-```
-Time: 0ms       → Client sends packet A → idle budget reset
-Time: 33–270ms  → (polls fire, but <300ms idle) → no resend
-Time: ~300ms    → 300ms idle reached → Keep-alive resends packet A → budget reset
-Time: ~600ms    → still idle → Keep-alive resends packet A again
-Time: 720ms     → Client sends packet B → idle budget reset
-Time: ~1020ms   → still idle → Keep-alive resends packet B
-...
-```
+Set `intervalMs` comfortably **under** the device's RX timeout so a missed or slightly-late tick still lands in time. For Codetinker the firmware RX timeout is **~1 second** (the device expects a host packet within 1s of its own transmit), so **300ms** is used — roughly three sends per timeout window. A cadence at or above the timeout (e.g. 1000ms) leaves no margin and is unsafe.
 
-### 2. During Firmware Update (DFU)
-```
-Time: 0ms     → DFU write #1 → idle budget reset
-Time: 10ms    → DFU write #2 → idle budget reset
-Time: 20ms    → DFU write #3 → idle budget reset
-...
-Result: Keep-alive never fires because the link never stays idle for 300ms
+## Dynamic payloads
+
+A control packet reflects mutable state, so resending a connect-time snapshot forever would replay stale state (e.g. revert a motor that has since stopped). When control state changes, the client refreshes the entry:
+
+```jsonc
+{ "method": "setKeepAlivePayload", "params": { "id": "ctrl", "payload": "<base64 new SET_CTRL>" } }
+// → { "id": "ctrl", "applied": true }
 ```
 
-## Technical Details
+The cadence is unchanged; the entry sends the new bytes from its next tick. A static packet (e.g. `ping`) never needs this.
 
-### Idle-Budget Behavior
+## How it works
 
-Link tracks the timestamp of the last TX — either a client `write` or a previous keep-alive resend. On each timer poll it resends only if that timestamp is older than the internal feed interval (~300ms).
+```
+Time: 0ms    → connect: entries [ping@300ms, ctrl@300ms] configured + started
+Time: 300ms  → ping timer fires → write PING (verbatim)
+Time: 300ms  → ctrl timer fires → write current SET_CTRL (verbatim)
+Time: 600ms  → ping → PING ; ctrl → SET_CTRL
+   ...
+(client calls setKeepAlivePayload("ctrl", X))
+Time: Nms    → ctrl timer fires → write X   ← picks up the new payload
+```
 
-This means:
-- **Idle state** — Keep-alive resends ~300ms after the last TX, then every ~300ms while idle
-- **Active state** — During firmware updates or frequent communication, writes keep the last-TX timestamp fresh, so keep-alive is effectively paused
-- **No explicit disable needed** — The mechanism self-manages based on activity
-- **Resends count as TX** — A forced resend refreshes the same budget, so one resend doesn't unlock the raw poll cadence; feeds stay ~300ms apart
+Each entry fires on its own `intervalMs` **regardless of client writes** — there is no resend-of-last-write and no idle budget. The only interaction with client writes is a shared write lock: a keep-alive tick is skipped if a client `write` is in progress at that instant (so two writes never overlap and corrupt the stream). It is **not** skipped just because a write happened recently.
 
 ### Architecture
 
 ```
 SerialSession (abstract)
-├── StartKeepAlive(interval)  → Start poll timer at the client interval
-├── StopKeepAlive()           → Stop and dispose timer
-└── OnKeepAliveTick()         → On each poll, resend cached packet if TX-idle ≥ feed interval
+├── ConfigureKeepAlive(entries)  → store the entry set (from connect)
+├── StartKeepAlive()             → start one cadence Timer per entry
+├── StopKeepAlive()              → stop and dispose every timer (blocks on in-flight ticks); entries kept
+├── OnKeepAliveTick(entry)       → write that entry's current payload, idle-only on the write lock
+├── setKeepAlive (RPC)           → toggle the whole set on/off
+└── setKeepAlivePayload (RPC)    → replace one entry's payload by id
 
 Platform-specific implementation (WinSerialSession, etc.)
 ├── StartKeepAlive() in DoConnect()
 └── StopKeepAlive() in DoDisconnect()
 ```
 
-## Firmware Update Safety
+## Firmware update safety
 
-**Q: Won't keep-alive packets interfere with firmware updates?**
+Keep-alive entries fire on their own cadence even during a write burst (the write lock only prevents overlap with the single write in flight, not packets between chunks). A keep-alive packet can therefore interleave between DFU chunks and corrupt the bootloader handshake.
 
-A: There are two layers of protection.
-
-**Layer 1 — Automatic (no client change needed).** During an active DFU burst:
-1. Each `write` request refreshes the last-TX timestamp.
-2. DFU chunks arrive faster than the ~300ms feed interval, so the idle budget never expires.
-3. Keep-alive only re-arms once the burst stops and the link sits idle for the feed interval.
-
-**Layer 2 — Explicit toggle (recommended for wireless DFU).** For setups where the bootloader handshake travels over a slow wireless link (e.g. USB dongle → wireless → CPU), there is a brief idle window between "wake bootloader" and the first DFU command where keep-alive *could* fire. Eliminate it by calling `setKeepAlive` to disable keep-alive before bootloader entry and re-enable it after DFU completes:
+**Always pause keep-alive explicitly around a firmware update.** Disable before bootloader entry, resume after:
 
 ```javascript
-await link.send("setKeepAlive", { intervalMs: null });
+await link.send("setKeepAlive", { intervalMs: null });   // pause all entries
 // ... run DFU ...
-await link.send("setKeepAlive", { intervalMs: 33 });
+await link.send("setKeepAlive", { intervalMs: 1 });      // any positive value resumes the configured entries
 ```
 
-See [SerialApiReference.md](SerialApiReference.md#setkeepalive) for the full method spec.
+`setKeepAlive(null)` stops every entry timer (blocking on any in-flight tick) but keeps the configured entries, so resume restarts the same set. See [SerialApiReference.md](SerialApiReference.md#setkeepalive) for the full spec.
 
-## Diagnosing Transport Issues
+## Diagnosing transport issues
 
-If you suspect bytes are being dropped, corrupted, or stalled in the Link layer, enable `wireTrace: true` on `connect`:
+If you suspect bytes are dropped, corrupted, or stalled in the Link layer, enable `wireTrace: true` on `connect`:
 
-```json
+```jsonc
 {
   "baudRate": 115200,
   "peripheralType": "codetinker",
-  "keepAliveIntervalMs": 33,
+  "keepAlive": [ { "id": "ping", "payload": "<base64>", "intervalMs": 300 } ],
   "wireTrace": true
 }
 ```
 
-Link will emit hex dumps via `Trace.WriteLine` for every TX/RX (including keep-alive resends). View them in [DebugView](https://learn.microsoft.com/sysinternals/downloads/debugview) or an attached debugger. Compare to the client's own message log to pinpoint where data diverges.
+Link emits hex dumps via `Trace.WriteLine` for every TX/RX, with the entry id on keep-alive sends:
+
+```
+wire-trace TX(keep-alive:ping) 5B a6 6a 01 ff 0c
+wire-trace TX(keep-alive:ctrl) 19B 11 22 33 ...
+```
+
+View in [DebugView](https://learn.microsoft.com/sysinternals/downloads/debugview) or an attached debugger; compare to the client's own message log to pinpoint where data diverges.
 
 ## Troubleshooting
 
 ### Device still times out
-- Verify `keepAliveIntervalMs` is set in the connect request
-- Check if the device actually requires keep-alive (some devices don't)
-- Try a shorter interval (e.g., 25ms instead of 33ms)
+- Verify every required packet is listed in `keepAlive` (e.g. Codetinker needs both `ping` **and** `ctrl`).
+- Verify `intervalMs` is under the device's RX timeout (use 300ms for Codetinker, not 1000ms).
+- For a dynamic packet, confirm the client calls `setKeepAlivePayload` so the entry has a non-empty payload.
 
-### Excessive resends visible in logs
-- This is expected behavior
-- Keep-alive packets only resend when there's no other activity
-- During normal operation, keep-alive should rarely fire
+### Device reverts to a stale state when idle
+- The dynamic entry (e.g. `ctrl`) is replaying old bytes. Call `setKeepAlivePayload` whenever control state changes so the idle feed stays current.
 
 ### Firmware update hangs or fails
-- Ensure the device supports the DFU protocol
-- Verify connection parameters (baud rate, etc.)
-- Check device logs for error messages
-
-## Related Features
-
-### Phase B: Firmware Transport Abstraction
-- `FirmwareTransportPort` interface (planned)
-- WebSerial adapter (planned)
-- WebSocketLink adapter (planned)
-- firmware-updater.ts transport-agnostic implementation (planned)
-
-The keep-alive mechanism works transparently with future firmware update features.
-
-## Support
-
-For issues or questions about keep-alive functionality:
-1. Check device documentation for timeout requirements
-2. Enable debug logging to see keep-alive packets
-3. Contact ALUX Labs support
+- Ensure keep-alive is paused with `setKeepAlive({ intervalMs: null })` before bootloader entry and resumed afterwards.
+- Verify connection parameters (baud rate, etc.).
 
 ---
 
-**Version**: 1.1  
-**Last Updated**: 2026-06-11  
+**Version**: 1.4
+**Last Updated**: 2026-06-15
 **Affected Devices**: Codetinker, and any device with sub-second timeout requirements

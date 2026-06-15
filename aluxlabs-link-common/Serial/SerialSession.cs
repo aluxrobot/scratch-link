@@ -26,24 +26,15 @@ using AluxLabs.Link.JsonRpc;
 internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     where TPort : class
 {
-    // Resend the last TX packet at most once per this interval while the client is idle. Sized well under the
-    // device's ~1 s RX watchdog (minus TX/RX transmission time) so a late tick on a slow PC still lands in time.
-    private const int KeepAliveFeedIntervalMs = 300;
-
     // Serializes DoWrite calls so two writes never overlap and corrupt the stream.
     private readonly SemaphoreSlim writeSemaphore = new SemaphoreSlim(1, 1);
 
-    // Guards keep-alive lifecycle fields shared with the timer callback.
+    // Guards keep-alive lifecycle fields shared with the timer callbacks.
     private readonly object stateLock = new object();
 
-    private byte[] lastSentData;
-    private byte[] keepAlivePayload;
-    private Timer keepAliveTimer;
+    // The periodic packets the device requires; each runs on its own cadence timer. Guarded by stateLock.
+    private readonly List<KeepAliveEntry> keepAliveEntries = new ();
     private bool keepAliveActive;
-
-    // 64-bit timestamps in DateTime.UtcNow.Ticks; accessed via Interlocked to keep reads/writes atomic on 32-bit runtimes.
-    private long lastClientTxTicks;
-    private long lastKeepAliveSentTicks;
 
     // volatile so threads outside stateLock see the latest value on the hot path.
     private volatile bool wireTrace;
@@ -62,6 +53,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         this.Handlers["startReading"] = this.HandleStartReading;
         this.Handlers["stopReading"] = this.HandleStopReading;
         this.Handlers["setKeepAlive"] = this.HandleSetKeepAlive;
+        this.Handlers["setKeepAlivePayload"] = this.HandleSetKeepAlivePayload;
         this.Handlers["triggerDTRReset"] = this.HandleTriggerDTRReset;
     }
 
@@ -147,11 +139,8 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             Trace.WriteLine("wire-trace: enabled for this session");
         }
 
-        // Store before the platform DoConnect starts the keep-alive timer so the first tick already sees it.
-        lock (this.stateLock)
-        {
-            this.keepAlivePayload = openParams.KeepAlivePayload;
-        }
+        // Configure before the platform DoConnect starts the timers so the first tick already sees the entries.
+        this.ConfigureKeepAlive(openParams.KeepAlive);
 
         return this.DoConnect(port, openParams);
     }
@@ -167,8 +156,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     protected abstract Task<object> DoConnect(TPort port, SerialOpenParams openParams);
 
     /// <summary>
-    /// JSON-RPC <c>write</c> handler. Caches the payload as the most recent TX packet
-    /// and stamps the client-TX time so keep-alive resends stay suppressed during active bursts.
+    /// JSON-RPC <c>write</c> handler. Sends a client message to the serial line under the write lock.
     /// </summary>
     /// <param name="methodName">Dispatched method name.</param>
     /// <param name="args">Decoded request params.</param>
@@ -186,13 +174,6 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         int sentBytes;
         try
         {
-            lock (this.stateLock)
-            {
-                this.lastSentData = buffer;
-            }
-
-            Interlocked.Exchange(ref this.lastClientTxTicks, DateTime.UtcNow.Ticks);
-
             if (this.wireTrace)
             {
                 Trace.WriteLine($"wire-trace TX {buffer.Length}B {FormatHex(buffer)}");
@@ -260,13 +241,13 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// JSON-RPC <c>setKeepAlive</c> handler. <c>intervalMs</c>: positive (re)starts, null/0/negative disables.
-    /// Idempotent: stop-then-start so repeated calls leave only one timer alive.
-    /// Response echoes the applied interval (null when disabled).
+    /// JSON-RPC <c>setKeepAlive</c> handler. Toggles the whole keep-alive timer set on or off:
+    /// a positive <c>intervalMs</c> resumes every configured entry on its own cadence; null/0/negative pauses all.
+    /// Idempotent (stop-then-start). Response echoes the applied value (null when paused).
     /// </summary>
     /// <param name="methodName">Dispatched method name.</param>
     /// <param name="args">Decoded request params.</param>
-    /// <returns>Echo of the applied interval.</returns>
+    /// <returns>Echo of the applied value.</returns>
     protected Task<object> HandleSetKeepAlive(string methodName, JsonElement? args)
     {
         int? requested = null;
@@ -277,17 +258,6 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             {
                 requested = prop.Value.GetInt32();
             }
-
-            // Only replace the payload when explicitly supplied; absent leaves the cached one intact across toggles.
-            var payloadProp = args.Value.TryGetProperty("keepAlivePayload");
-            if (payloadProp.HasValue && payloadProp.Value.ValueKind != JsonValueKind.Null)
-            {
-                var payload = DecodeKeepAlivePayload(payloadProp.Value.GetString());
-                lock (this.stateLock)
-                {
-                    this.keepAlivePayload = payload;
-                }
-            }
         }
 
         // Stop-then-start makes the call idempotent regardless of current state.
@@ -296,13 +266,49 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         int? applied = null;
         if (requested.HasValue && requested.Value > 0)
         {
-            this.StartKeepAlive(requested.Value);
+            this.StartKeepAlive();
             applied = requested.Value;
         }
 
         var appliedText = applied?.ToString() ?? "null";
         Trace.WriteLine($"keep-alive: setKeepAlive applied intervalMs={appliedText}");
         return Task.FromResult<object>(new Dictionary<string, object> { ["intervalMs"] = applied });
+    }
+
+    /// <summary>
+    /// JSON-RPC <c>setKeepAlivePayload</c> handler. Replaces the payload of one configured entry at runtime so a
+    /// dynamic packet stays current; the cadence is unchanged and the next tick sends the new bytes. An unknown id
+    /// leaves every entry untouched and reports <c>applied: false</c>.
+    /// </summary>
+    /// <param name="methodName">Dispatched method name.</param>
+    /// <param name="args">Decoded request params.</param>
+    /// <returns>Echo of the id and whether it matched a configured entry.</returns>
+    protected Task<object> HandleSetKeepAlivePayload(string methodName, JsonElement? args)
+    {
+        var id = args?.TryGetProperty("id")?.GetString();
+        if (string.IsNullOrEmpty(id))
+        {
+            throw JsonRpc2Error.InvalidParams("setKeepAlivePayload requires an id").ToException();
+        }
+
+        var payload = DecodeKeepAlivePayload(args?.TryGetProperty("payload")?.GetString());
+
+        var applied = false;
+        lock (this.stateLock)
+        {
+            foreach (var entry in this.keepAliveEntries)
+            {
+                if (entry.Id == id)
+                {
+                    entry.Payload = payload;
+                    applied = true;
+                    break;
+                }
+            }
+        }
+
+        Trace.WriteLine($"keep-alive: setKeepAlivePayload id={id} applied={applied}");
+        return Task.FromResult<object>(new Dictionary<string, object> { ["id"] = id, ["applied"] = applied });
     }
 
     /// <summary>
@@ -403,25 +409,32 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Start the keep-alive timer at <paramref name="keepAliveIntervalMs"/>. Null or non-positive disables.
-    /// No-op if already running.
+    /// Replace the configured keep-alive entry set. Does not start timers; the platform layer calls
+    /// <see cref="StartKeepAlive"/> once the port is open.
     /// </summary>
-    /// <param name="keepAliveIntervalMs">Interval in milliseconds; null/non-positive disables.</param>
-    protected void StartKeepAlive(int? keepAliveIntervalMs)
+    /// <param name="entries">The periodic packets the device requires, or null/empty to disable keep-alive.</param>
+    protected void ConfigureKeepAlive(IReadOnlyList<KeepAliveEntryParam> entries)
     {
-        if (keepAliveIntervalMs == null || keepAliveIntervalMs.Value <= 0)
+        lock (this.stateLock)
         {
-            return;
+            this.keepAliveEntries.Clear();
+            if (entries == null)
+            {
+                return;
+            }
+
+            foreach (var entry in entries)
+            {
+                this.keepAliveEntries.Add(new KeepAliveEntry(entry.Id, entry.IntervalMs, entry.Payload));
+            }
         }
+    }
 
-        var interval = keepAliveIntervalMs.Value;
-
-        // Seed timestamps to "now" so the first tick doesn't read zero-initialized fields as ancient TX activity
-        // and fire an immediate resend before the client has written anything.
-        var nowTicks = DateTime.UtcNow.Ticks;
-        Interlocked.Exchange(ref this.lastClientTxTicks, nowTicks);
-        Interlocked.Exchange(ref this.lastKeepAliveSentTicks, nowTicks);
-
+    /// <summary>
+    /// Start a cadence timer for every configured entry. No-op if already running or if nothing is configured.
+    /// </summary>
+    protected void StartKeepAlive()
+    {
         lock (this.stateLock)
         {
             if (this.keepAliveActive)
@@ -430,20 +443,27 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
                 return;
             }
 
-            this.keepAliveActive = true;
-            this.keepAliveTimer = new Timer(this.OnKeepAliveTick, null, interval, interval);
-        }
+            if (this.keepAliveEntries.Count == 0)
+            {
+                return;
+            }
 
-        Trace.WriteLine($"keep-alive: started ({interval}ms)");
+            this.keepAliveActive = true;
+            foreach (var entry in this.keepAliveEntries)
+            {
+                entry.Timer = new Timer(this.OnKeepAliveTick, entry, entry.IntervalMs, entry.IntervalMs);
+                Trace.WriteLine($"keep-alive: started id={entry.Id} ({entry.IntervalMs}ms)");
+            }
+        }
     }
 
     /// <summary>
-    /// Stop the keep-alive timer and block until any in-flight tick finishes.
-    /// Safe to call repeatedly.
+    /// Stop and dispose every entry's timer, blocking until any in-flight tick finishes. Keeps the configured
+    /// entries so a later <see cref="StartKeepAlive"/> can resume them. Safe to call repeatedly.
     /// </summary>
     protected void StopKeepAlive()
     {
-        Timer toDispose;
+        List<Timer> toDispose;
         lock (this.stateLock)
         {
             if (!this.keepAliveActive)
@@ -452,15 +472,22 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             }
 
             this.keepAliveActive = false;
-            toDispose = this.keepAliveTimer;
-            this.keepAliveTimer = null;
+            toDispose = new List<Timer>(this.keepAliveEntries.Count);
+            foreach (var entry in this.keepAliveEntries)
+            {
+                if (entry.Timer != null)
+                {
+                    toDispose.Add(entry.Timer);
+                    entry.Timer = null;
+                }
+            }
         }
 
-        if (toDispose != null)
+        foreach (var timer in toDispose)
         {
-            // Block so no resend races a subsequent disconnect or port disposal.
+            // Block so no send races a subsequent disconnect or port disposal.
             using var waitHandle = new ManualResetEvent(false);
-            if (toDispose.Dispose(waitHandle))
+            if (timer.Dispose(waitHandle))
             {
                 waitHandle.WaitOne();
             }
@@ -526,15 +553,49 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             StopBits = args?.TryGetProperty("stopBits")?.GetString() ?? "one",
             FlowControl = args?.TryGetProperty("flowControl")?.GetString() ?? "none",
             PeripheralType = args?.TryGetProperty("peripheralType")?.GetString(),
-            KeepAliveIntervalMs = args?.TryGetProperty("keepAliveIntervalMs")?.GetInt32(),
-            KeepAlivePayload = ParseKeepAlivePayload(args),
+            KeepAlive = ParseKeepAlive(args),
             WireTrace = args?.TryGetProperty("wireTrace")?.GetBoolean() ?? false,
         };
     }
 
-    private static byte[] ParseKeepAlivePayload(JsonElement? args)
+    private static IReadOnlyList<KeepAliveEntryParam> ParseKeepAlive(JsonElement? args)
     {
-        return DecodeKeepAlivePayload(args?.TryGetProperty("keepAlivePayload")?.GetString());
+        var result = new List<KeepAliveEntryParam>();
+
+        var element = args?.TryGetProperty("keepAlive");
+        if (element == null || element.Value.ValueKind == JsonValueKind.Null)
+        {
+            return result;
+        }
+
+        if (element.Value.ValueKind != JsonValueKind.Array)
+        {
+            throw JsonRpc2Error.InvalidParams("'keepAlive' must be an array").ToException();
+        }
+
+        foreach (var item in element.Value.EnumerateArray())
+        {
+            var id = item.TryGetProperty("id")?.GetString();
+            if (string.IsNullOrEmpty(id))
+            {
+                throw JsonRpc2Error.InvalidParams("keepAlive entry requires an id").ToException();
+            }
+
+            var intervalMs = item.TryGetProperty("intervalMs")?.GetInt32();
+            if (intervalMs == null || intervalMs.Value <= 0)
+            {
+                throw JsonRpc2Error.InvalidParams($"keepAlive entry '{id}' requires a positive intervalMs").ToException();
+            }
+
+            result.Add(new KeepAliveEntryParam
+            {
+                Id = id,
+                IntervalMs = intervalMs.Value,
+                Payload = DecodeKeepAlivePayload(item.TryGetProperty("payload")?.GetString()),
+            });
+        }
+
+        return result;
     }
 
     private static byte[] DecodeKeepAlivePayload(string base64)
@@ -550,7 +611,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         }
         catch (FormatException)
         {
-            throw JsonRpc2Error.InvalidParams("keepAlivePayload must be base64-encoded").ToException();
+            throw JsonRpc2Error.InvalidParams("keepAlive payload must be base64-encoded").ToException();
         }
     }
 
@@ -586,8 +647,9 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
     private async void OnKeepAliveTick(object state)
     {
+        var entry = (KeepAliveEntry)state;
+
         byte[] data;
-        bool payloadMode;
         lock (this.stateLock)
         {
             if (!this.keepAliveActive)
@@ -595,25 +657,12 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
                 return;
             }
 
-            payloadMode = this.keepAlivePayload != null;
-            data = payloadMode ? this.keepAlivePayload : this.lastSentData;
+            data = entry.Payload;
         }
 
         if (data == null || data.Length == 0 || !this.IsConnected)
         {
             return;
-        }
-
-        // Payload mode is ungated: its timer interval is itself the client-configured send cadence.
-        if (!payloadMode)
-        {
-            var nowTicks = DateTime.UtcNow.Ticks;
-            var msSinceClientTx = (nowTicks - Interlocked.Read(ref this.lastClientTxTicks)) / TimeSpan.TicksPerMillisecond;
-            var msSinceKeepAlive = (nowTicks - Interlocked.Read(ref this.lastKeepAliveSentTicks)) / TimeSpan.TicksPerMillisecond;
-            if (Math.Min(msSinceClientTx, msSinceKeepAlive) < KeepAliveFeedIntervalMs)
-            {
-                return;
-            }
         }
 
         // WaitAsync(0) makes the tick idle-only: during a write burst the semaphore is busy and we no-op.
@@ -631,11 +680,10 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
             if (this.wireTrace)
             {
-                Trace.WriteLine($"wire-trace TX(keep-alive) {data.Length}B {FormatHex(data)}");
+                Trace.WriteLine($"wire-trace TX(keep-alive:{entry.Id}) {data.Length}B {FormatHex(data)}");
             }
 
             await this.DoWrite(data).ConfigureAwait(false);
-            Interlocked.Exchange(ref this.lastKeepAliveSentTicks, DateTime.UtcNow.Ticks);
         }
         catch (ObjectDisposedException)
         {
@@ -644,7 +692,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         catch (Exception e)
         {
             // async-void Timer callback: an escaped exception terminates the process, so log and move on.
-            Trace.WriteLine($"keep-alive: resend failed: {e.GetType().Name}: {e.Message}");
+            Trace.WriteLine($"keep-alive[{entry.Id}]: send failed: {e.GetType().Name}: {e.Message}");
         }
         finally
         {
@@ -830,5 +878,25 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         [JsonPropertyName("productId")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string ProductId { get; set; }
+    }
+
+    private sealed class KeepAliveEntry
+    {
+        public KeepAliveEntry(string id, int intervalMs, byte[] payload)
+        {
+            this.Id = id;
+            this.IntervalMs = intervalMs;
+            this.Payload = payload;
+        }
+
+        public string Id { get; }
+
+        public int IntervalMs { get; }
+
+        // Mutable so setKeepAlivePayload can refresh a dynamic packet; guarded by stateLock.
+        public byte[] Payload { get; set; }
+
+        // Created by StartKeepAlive, nulled and disposed by StopKeepAlive; guarded by stateLock.
+        public Timer Timer { get; set; }
     }
 }
