@@ -6,6 +6,7 @@
 namespace AluxLabs.Link.Serial;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text.Json;
@@ -34,10 +35,20 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
     // The periodic packets the device requires; each runs on its own cadence timer. Guarded by stateLock.
     private readonly List<KeepAliveEntry> keepAliveEntries = new ();
+
+    // Client writes and keep-alive packets awaiting a device read while paced; drained in FIFO order by FlushTxQueue.
+    private readonly ConcurrentQueue<byte[]> txQueue = new ();
+
     private bool keepAliveActive;
 
     // volatile so threads outside stateLock see the latest value on the hot path.
     private volatile bool wireTrace;
+
+    // When set, TX is gated on device RX: writes queue instead of going out immediately. Configured at connect.
+    private volatile bool pacedWrite;
+
+    // Sent on a device read when the paced queue is empty; null disables the fallback. Configured at connect.
+    private volatile byte[] idlePayload;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SerialSession{TPort}"/> class.
@@ -54,6 +65,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         this.Handlers["stopReading"] = this.HandleStopReading;
         this.Handlers["setKeepAlive"] = this.HandleSetKeepAlive;
         this.Handlers["setKeepAlivePayload"] = this.HandleSetKeepAlivePayload;
+        this.Handlers["setPacedWrite"] = this.HandleSetPacedWrite;
         this.Handlers["triggerDTRReset"] = this.HandleTriggerDTRReset;
     }
 
@@ -139,6 +151,14 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             Trace.WriteLine("wire-trace: enabled for this session");
         }
 
+        this.txQueue.Clear();
+        this.pacedWrite = openParams.PacedWrite;
+        this.idlePayload = openParams.IdlePayload;
+        if (this.pacedWrite)
+        {
+            Trace.WriteLine("paced-write: TX queued, flushed on device RX");
+        }
+
         // Configure before the platform DoConnect starts the timers so the first tick already sees the entries.
         this.ConfigureKeepAlive(openParams.KeepAlive);
 
@@ -169,6 +189,17 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         }
 
         var buffer = EncodingHelpers.DecodeBuffer(args.Value);
+
+        if (this.pacedWrite)
+        {
+            if (this.wireTrace)
+            {
+                Trace.WriteLine($"wire-trace TX(queued) {buffer.Length}B {FormatHex(buffer)}");
+            }
+
+            this.txQueue.Enqueue(buffer);
+            return new Dictionary<string, int> { ["sentBytes"] = buffer.Length };
+        }
 
         await this.writeSemaphore.WaitAsync().ConfigureAwait(false);
         int sentBytes;
@@ -291,7 +322,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             throw JsonRpc2Error.InvalidParams("setKeepAlivePayload requires an id").ToException();
         }
 
-        var payload = DecodeKeepAlivePayload(args?.TryGetProperty("payload")?.GetString());
+        var payload = DecodeBase64Payload(args?.TryGetProperty("payload")?.GetString());
 
         var applied = false;
         lock (this.stateLock)
@@ -309,6 +340,29 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         Trace.WriteLine($"keep-alive: setKeepAlivePayload id={id} applied={applied}");
         return Task.FromResult<object>(new Dictionary<string, object> { ["id"] = id, ["applied"] = applied });
+    }
+
+    /// <summary>
+    /// JSON-RPC <c>setPacedWrite</c> handler. Switches device-RX-gated write queuing on or off at runtime. Disable it
+    /// before a raw request-response sequence (e.g. a bootloader firmware update) so writes go out immediately and
+    /// unbuffered. Toggling either way discards any queued packets. Response echoes the applied state.
+    /// </summary>
+    /// <param name="methodName">Dispatched method name.</param>
+    /// <param name="args">Decoded request params.</param>
+    /// <returns>Echo of the applied state.</returns>
+    protected Task<object> HandleSetPacedWrite(string methodName, JsonElement? args)
+    {
+        var enabled = args?.TryGetProperty("enabled")?.GetBoolean();
+        if (enabled == null)
+        {
+            throw JsonRpc2Error.InvalidParams("setPacedWrite requires an 'enabled' boolean").ToException();
+        }
+
+        this.pacedWrite = enabled.Value;
+        this.txQueue.Clear();
+
+        Trace.WriteLine($"paced-write: setPacedWrite enabled={enabled.Value}");
+        return Task.FromResult<object>(new Dictionary<string, object> { ["enabled"] = enabled.Value });
     }
 
     /// <summary>
@@ -363,6 +417,11 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             Encoding = "base64",
             Message = encoded,
         });
+
+        if (this.pacedWrite)
+        {
+            await this.FlushTxQueue();
+        }
     }
 
     /// <summary>
@@ -554,6 +613,8 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             FlowControl = args?.TryGetProperty("flowControl")?.GetString() ?? "none",
             PeripheralType = args?.TryGetProperty("peripheralType")?.GetString(),
             KeepAlive = ParseKeepAlive(args),
+            PacedWrite = args?.TryGetProperty("pacedWrite")?.GetBoolean() ?? false,
+            IdlePayload = DecodeBase64Payload(args?.TryGetProperty("idlePayload")?.GetString()),
             WireTrace = args?.TryGetProperty("wireTrace")?.GetBoolean() ?? false,
         };
     }
@@ -591,14 +652,14 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             {
                 Id = id,
                 IntervalMs = intervalMs.Value,
-                Payload = DecodeKeepAlivePayload(item.TryGetProperty("payload")?.GetString()),
+                Payload = DecodeBase64Payload(item.TryGetProperty("payload")?.GetString()),
             });
         }
 
         return result;
     }
 
-    private static byte[] DecodeKeepAlivePayload(string base64)
+    private static byte[] DecodeBase64Payload(string base64)
     {
         if (string.IsNullOrEmpty(base64))
         {
@@ -611,7 +672,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         }
         catch (FormatException)
         {
-            throw JsonRpc2Error.InvalidParams("keepAlive payload must be base64-encoded").ToException();
+            throw JsonRpc2Error.InvalidParams("payload must be base64-encoded").ToException();
         }
     }
 
@@ -645,6 +706,52 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         return sb.ToString();
     }
 
+    private async Task FlushTxQueue()
+    {
+        await this.writeSemaphore.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var sentAny = false;
+            while (this.txQueue.TryDequeue(out var packet))
+            {
+                sentAny = true;
+                if (this.wireTrace)
+                {
+                    Trace.WriteLine($"wire-trace TX(flush) {packet.Length}B {FormatHex(packet)}");
+                }
+
+                await this.DoWrite(packet).ConfigureAwait(false);
+            }
+
+            var idle = this.idlePayload;
+            if (!sentAny && idle != null && idle.Length > 0)
+            {
+                if (this.wireTrace)
+                {
+                    Trace.WriteLine($"wire-trace TX(idle) {idle.Length}B {FormatHex(idle)}");
+                }
+
+                await this.DoWrite(idle).ConfigureAwait(false);
+            }
+        }
+        catch (Exception e)
+        {
+            // DidReceiveData is fire-and-forget, so an escaped exception would go unobserved; log and stop the flush.
+            Trace.WriteLine($"paced flush failed: {e.GetType().Name}: {e.Message}");
+        }
+        finally
+        {
+            try
+            {
+                this.writeSemaphore.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Semaphore disposed during shutdown.
+            }
+        }
+    }
+
     private async void OnKeepAliveTick(object state)
     {
         var entry = (KeepAliveEntry)state;
@@ -662,6 +769,13 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         if (data == null || data.Length == 0 || !this.IsConnected)
         {
+            return;
+        }
+
+        // In paced mode the device read gates all TX, so periodic packets join the queue rather than going out now.
+        if (this.pacedWrite)
+        {
+            this.txQueue.Enqueue(data);
             return;
         }
 

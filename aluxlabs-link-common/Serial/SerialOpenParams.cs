@@ -49,6 +49,17 @@ internal class SerialOpenParams
     public IReadOnlyList<KeepAliveEntryParam> KeepAlive { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether writes are buffered and flushed to the line only when the device
+    /// sends data, rather than written immediately. Off by default.
+    /// </summary>
+    public bool PacedWrite { get; set; }
+
+    /// <summary>
+    /// Gets or sets the packet sent on a device read when the paced-write queue is empty. Null disables the fallback.
+    /// </summary>
+    public byte[] IdlePayload { get; set; }
+
+    /// <summary>
     /// Gets or sets a value indicating whether wire-level TX/RX hex dumps are emitted via
     /// <see cref="System.Diagnostics.Trace"/>. Diagnostic only; off by default.
     /// </summary>
