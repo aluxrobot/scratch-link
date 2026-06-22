@@ -38,3 +38,6 @@ ref/
 
 # Staged distribution bundles (서명된 .msixbundle — 대용량이라 커밋 금지. .appinstaller 템플릿은 dist/ 직하에 별도 커밋)
 /aluxlabs-link-win-msix/dist/upload/
+
+# 오프라인/USB 설치 패키지 조립 산출물 (make offline-pack — 대용량 번들·VCLibs 포함)
+/aluxlabs-link-win-msix/dist/AluxLabsLink-Offline/

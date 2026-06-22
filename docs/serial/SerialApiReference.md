@@ -51,7 +51,7 @@ Discovered ports arrive as `didDiscoverPeripheral` notifications:
     "peripheralId": "port-0",
     "name": "COM7 (CH340)",
     "path": "COM7",
-    "vendorId": "0x1a86",
+    "vendorId": "0x1A86",
     "productId": "0x7523",
     "rssi": 0
   }
@@ -392,7 +392,7 @@ Sent for each discovered serial port during discovery.
     "peripheralId": "port-0",
     "name": "COM7 (CH340)",
     "path": "COM7",
-    "vendorId": "0x1a86",
+    "vendorId": "0x1A86",
     "productId": "0x7523",
     "rssi": 0
   }
