@@ -55,7 +55,7 @@ WINDOWS_IMAGES = \
 	aluxlabs-link-win-msix/Images/StoreLogo.png \
 	aluxlabs-link-win-msix/Images/Wide310x150Logo.scale-200.png
 
-.PHONY: all clean mac windows sync-s3 sync-s3-dev appinstaller stage-deps show-version set-version release-patch release-minor
+.PHONY: all clean mac windows sync-s3 sync-s3-dev appinstaller stage-deps offline-pack show-version set-version release-patch release-minor
 
 # S3 배포: dist/upload/의 서명된 번들 + .appinstaller를 scratch-link 버킷에 업로드.
 # 운영: make sync-s3      → https://scratch-link.aluxcoding.com/
@@ -81,6 +81,11 @@ AWS_REGION       ?= ap-northeast-2
 # 버전 갱신 시: Release 패키지의 AppPackages/*/Dependencies/{x64,x86}/ 에서 이 폴더로 덮어쓰고 템플릿 Version 갱신.
 VCLIBS           ?= Microsoft.VCLibs.x64.14.00.appx Microsoft.VCLibs.x64.14.00.Desktop.appx Microsoft.VCLibs.x86.14.00.appx Microsoft.VCLibs.x86.14.00.Desktop.appx
 VCLIBS_SRC       ?= aluxlabs-link-win-msix/Dependencies
+
+# 오프라인/USB 설치 패키지 (make offline-pack). 번들이 여러 개면 OFFLINE_BUNDLE=<파일명> 으로 지정.
+OFFLINE_DIR      ?= aluxlabs-link-win-msix/dist/AluxLabsLink-Offline
+OFFLINE_BUNDLE   ?= $(notdir $(wildcard $(S3_SRC)*.msixbundle))
+OFFLINE_SCRIPT   ?= aluxlabs-link-win-msix/Install-Offline.ps1
 
 # --- 버전 관리 + .appinstaller 생성 (Windows 전용) ---
 # 단일 소스: SharedProps/Version.props 의 <ReleaseTriplet> (= Major.Minor.Patch). 4번째 Build 는 커밋 수 자동.
@@ -140,10 +145,22 @@ appinstaller:
 	sed -e 's|__HOST__|$(APPINSTALLER_HOST_DEV)|g' -e 's|__VERSION__|$(BUNDLE_VERSION)|g' -e 's|__BUNDLE__|$(S3_BUNDLE)|g' "$(APPINSTALLER_TEMPLATE)" > "$(APPINSTALLER_DEV)"
 	@echo "appinstaller 생성: $(BUNDLE_VERSION) (prod + dev)"
 
-# 빌드 산출물 Dependencies/{x64,x86}/ 의 VCLibs appx 를 dist/upload/ 로 평탄화 복사 (업로드 소스 통일)
+# 레포 고정 VCLibs(Dependencies/{x64,x86}/)를 dist/upload/ 로 평탄화 복사 (업로드 소스 통일)
 stage-deps:
-	$(if $(strip $(VCLIBS_SRC)),,$(error AppPackages/*/Dependencies 없음 — Release 패키지 빌드 먼저))
+	$(if $(strip $(VCLIBS_SRC)),,$(error $(VCLIBS_SRC) 없음))
 	for f in $(VCLIBS); do a=$$(echo $$f | sed -E 's/.*\.(x64|x86)\..*/\1/'); cp -v "$(VCLIBS_SRC)/$$a/$$f" "$(S3_SRC)$$f"; done
+
+# 오프라인/USB 설치 패키지 조립: 서명된 번들 + Install-Offline.ps1 + VCLibs 를 한 폴더로 모은다.
+# 번들이 여러 개면 OFFLINE_BUNDLE=<파일명> 으로 명시.
+offline-pack:
+	$(if $(strip $(OFFLINE_BUNDLE)),,$(error $(S3_SRC) 에 릴리스 *.msixbundle 없음 — 빌드/서명/스테이징 먼저))
+	$(if $(filter 1,$(words $(OFFLINE_BUNDLE))),,$(error 번들이 여러 개임: $(OFFLINE_BUNDLE) → make offline-pack OFFLINE_BUNDLE=<파일명>))
+	rm -rf "$(OFFLINE_DIR)"
+	mkdir -p "$(OFFLINE_DIR)/Dependencies"
+	cp -v "$(S3_SRC)$(OFFLINE_BUNDLE)" "$(OFFLINE_DIR)/"
+	cp -v "$(OFFLINE_SCRIPT)" "$(OFFLINE_DIR)/"
+	cp -v $(VCLIBS_SRC)/x64/*.appx $(VCLIBS_SRC)/x86/*.appx "$(OFFLINE_DIR)/Dependencies/"
+	@echo "오프라인 패키지: $(OFFLINE_DIR) ($(OFFLINE_BUNDLE)) — USB로 복사 후 Install-Offline.ps1 실행"
 
 # Assumes the input SVG is square and that pixel [0,0] is a good background color
 # Pads the output horizontally, using the background color, to match the requested size

@@ -81,7 +81,7 @@ playground 예시는 `self.AluxLabs.BLE`, `self.AluxLabs.BT` 만 사용하도록
 다음은 외부 호환을 위해 **그대로 유지**된다:
 
 - **JSON-RPC 2.0 메서드 이름** — `discover`, `connect`, `read`, `write`, `send`, `getVersion`, `pingMe`, `didDiscoverPeripheral`, `didReceiveMessage` 등. 와이어 프로토콜 변경 없음.
-- **WebSocket 엔드포인트 경로** — `/scratch/ble`, `/scratch/bt` 그대로. 클라이언트 코드 수정 불필요.
+- **WebSocket 엔드포인트 경로** — `/scratch/ble`, `/scratch/bt`, `/scratch/serial` 그대로. 클라이언트 코드 수정 불필요.
 - **NetworkProtocol 버전** — 현재 `1.4`. (1.3→1.4에서 `getVersion` 응답에 `app` 필드가 추가됐고, 메서드·엔드포인트는 호환 유지.)
 - **npm 패키지명** — 우리 측에서 scratch-vm 을 참조할 때 `./node_modules/scratch-vm/...` 경로를 그대로 사용. 패키지명 자체는 외부 의존성이므로 scratch-vm 측 결정 사항.
 

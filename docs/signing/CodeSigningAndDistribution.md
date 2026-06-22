@@ -236,7 +236,7 @@ AluxLabsLink-Install\
    └─ Microsoft.VCLibs.x86.14.00.Desktop.appx
 ```
 
-(VCLibs 원본은 레포 [`aluxlabs-link-win-msix/Dependencies/`](../../aluxlabs-link-win-msix/Dependencies/)에서 복사. 번들은 서명된 운영본.)
+이 폴더는 **`make offline-pack`** 이 `dist/AluxLabsLink-Offline/` 에 자동 조립한다(서명된 번들은 `dist/upload/`에 staging 돼 있어야 함). 번들이 여러 개면 `make offline-pack OFFLINE_BUNDLE=<파일명>` 으로 지정. VCLibs 원본은 레포 [`aluxlabs-link-win-msix/Dependencies/`](../../aluxlabs-link-win-msix/Dependencies/).
 
 설치(대상 PC에서):
 
