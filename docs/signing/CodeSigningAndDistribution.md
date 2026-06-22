@@ -115,6 +115,23 @@ VS GUI로 할 경우: wapproj 우클릭 → **게시(Publish) → 앱 패키지 
 
 스키마는 `2017/2` (Windows 1809+ 호환 — 매니페스트 MinVersion과 동일). `Publisher`는 인증서 Subject와 일치.
 
+### 프레임워크 의존성 — VCLibs (필수, 누락 시 새 PC 설치 실패)
+
+번들은 self-contained(Windows App SDK)라 WindowsAppRuntime 의존성은 없지만, **VCLibs 프레임워크 패키지 2종**에는 여전히 의존한다 — 번들에 포함될 수 없는 공유 패키지로, OS에 별도 설치되어 여러 앱이 공유한다:
+
+| 패키지 | MinVersion |
+|---|---|
+| `Microsoft.VCLibs.140.00` | 14.0.33519.0 |
+| `Microsoft.VCLibs.140.00.UWPDesktop` | 14.0.33728.0 |
+
+VS·다른 Store 앱·이전 사이드로드가 있는 PC엔 이미 깔려 있어 그냥 설치되지만, **완전히 새 PC엔 없다.** `.appinstaller`의 `<Dependencies>`가 다운로드 위치를 알려주지 않으면 *"앱 설치 관리자가 패키지 종속 파일을 설치하지 못했습니다. 개발자에게 패키지를 요청하세요."* 로 실패한다. 그래서:
+
+- 템플릿 `<Dependencies>`에 x64·x86 4개 `<Package>`를 선언 — 같은 호스트 루트(`https://__HOST__/...`)에서 받도록.
+- VCLibs appx 4개를 번들과 **같은 버킷 루트에 함께 호스팅**한다(아래 호스팅 절).
+- appx 원본은 레포에 고정 체크인: [`aluxlabs-link-win-msix/Dependencies/`](../../aluxlabs-link-win-msix/Dependencies/) (`x64/`·`x86/`). `make stage-deps`가 `dist/upload/`로 평탄화 복사하고 `make sync-s3`가 업로드한다.
+
+> VCLibs는 Microsoft 서명·고정 버전이라 **불변**(long-cache 가능). 버전이 올라가면 Release 빌드 산출물 `AppPackages/*/Dependencies/{x64,x86}/`에서 레포 폴더로 덮어쓰고 템플릿의 각 `<Package>` `Version`을 갱신한다.
+
 ### 버전 — 한 곳만 (Version.props)
 
 `.appinstaller`의 버전·번들 파일명은 **빌드된 번들과 자동으로 일치**한다 — `make`가 staging 된 번들명(`AluxLabs-Link-<버전>.msixbundle`)에서 버전을 그대로 주입하기 때문. 손으로 맞출 곳은 없다.
@@ -140,28 +157,40 @@ Get-AppLockerFileInformation -Path .\AluxLabs-Link-x.y.z.msixbundle | Select-Obj
 
 ```
 scratch-link.aluxcoding.com/
-  AluxLabsLink.appinstaller          # 고정 URL (진입점, 불변)
-  AluxLabs-Link-x.y.z.msixbundle     # 토큰 서명된 번들 (버전별)
+  AluxLabsLink.appinstaller                  # 고정 URL (진입점, 불변)
+  AluxLabs-Link-x.y.z.msixbundle             # 토큰 서명된 번들 (버전별)
+  Microsoft.VCLibs.x64.14.00.appx            # 프레임워크 의존성 (불변, long-cache)
+  Microsoft.VCLibs.x64.14.00.Desktop.appx
+  Microsoft.VCLibs.x86.14.00.appx
+  Microsoft.VCLibs.x86.14.00.Desktop.appx
 ```
 
 진입점 URL: `https://scratch-link.aluxcoding.com/AluxLabsLink.appinstaller`
 
 - **`.appinstaller` URL은 영원히 고정**. `.msixbundle` URL은 버전마다 바뀌어도 됨.
+- **VCLibs 4개는 `<Dependencies>`가 가리키는 URL과 정확히 일치**해야 한다(파일명·루트). 없으면 새 PC에서 종속성 설치 실패.
 - **MIME 타입 필수** — 콘솔 업로드는 `binary/octet-stream`이 붙어 깨진다. 반드시 `--content-type` 지정:
   - `.appinstaller` → `application/appinstaller`
-  - `.msixbundle` → `application/vnd.ms-appx`
+  - `.msixbundle` / `.appx` → `application/vnd.ms-appx`
 - 업로드 후 **CloudFront 무효화** 필수 (안 하면 옛 캐시가 잘못된 MIME로 남음).
   - 배포 ID: prod `E3HEXR4KAZLITV`, dev `E1WMSQXPP9L5YF`
 
-업로드 + 무효화 명령 (CLI 자격증명 필요 — IAM 정책 `scripts/aws/policies/iam-policy.json.tpl`):
+업로드는 **`make sync-s3`(dev면 `sync-s3-dev`) 한 번**이면 된다 — appinstaller 생성 + VCLibs `stage-deps`·업로드 + 번들 업로드 + CloudFront 무효화까지 수행한다. (CLI 자격증명 필요 — IAM 정책 `scripts/aws/policies/iam-policy.json.tpl`)
+
+수동으로 올릴 때 (참고용 — 번들·VCLibs·appinstaller·무효화를 직접):
 
 ```powershell
 $v = "1.0.0.1028"   # 실제 빌드 버전
 $b = "scratch-link.aluxcoding.com"   # dev면 dev-scratch-link.aluxcoding.com
 aws s3 cp "dist\upload\AluxLabs-Link-$v.msixbundle" "s3://$b/AluxLabs-Link-$v.msixbundle" --content-type application/vnd.ms-appx --cache-control "public, max-age=31536000, immutable"
+foreach ($f in "Microsoft.VCLibs.x64.14.00.appx","Microsoft.VCLibs.x64.14.00.Desktop.appx","Microsoft.VCLibs.x86.14.00.appx","Microsoft.VCLibs.x86.14.00.Desktop.appx") {
+  aws s3 cp "dist\upload\$f" "s3://$b/$f" --content-type application/vnd.ms-appx --cache-control "public, max-age=31536000, immutable"
+}
 aws s3 cp "dist\upload\AluxLabsLink.appinstaller"   "s3://$b/AluxLabsLink.appinstaller"   --content-type application/appinstaller --cache-control "public, max-age=300"
-aws cloudfront create-invalidation --distribution-id E3HEXR4KAZLITV --paths "/AluxLabsLink.appinstaller" "/AluxLabs-Link-$v.msixbundle"
+aws cloudfront create-invalidation --distribution-id E3HEXR4KAZLITV --paths "/AluxLabsLink.appinstaller" "/AluxLabs-Link-$v.msixbundle" "/Microsoft.VCLibs.*"
 ```
+
+> VCLibs는 처음 한 번만 올리면 이후 버전 릴리스에선 이미 호스팅돼 있어 생략 가능(버전이 바뀌지 않는 한). `make sync-s3`는 매번 멱등하게 다시 올린다.
 
 검증 (HTTP HEAD로 Content-Type 확인):
 ```powershell
@@ -176,5 +205,47 @@ Invoke-WebRequest -Method Head "https://scratch-link.aluxcoding.com/AluxLabsLink
 4. [ ] `signtool`로 서명 — **`/sha1 <썸프린트>` 권장** (`/n` 이름 매칭은 간헐 실패)
 5. [ ] `signtool verify /pa`로 서명 검증
 6. [ ] 서명된 번들을 `dist/upload/`로 복사
-7. [ ] `make sync-s3` (dev면 `sync-s3-dev`) — appinstaller 자동 생성 + 업로드 + CloudFront 무효화
+7. [ ] `make sync-s3` (dev면 `sync-s3-dev`) — appinstaller 생성 + VCLibs stage·업로드 + 번들 업로드 + CloudFront 무효화
 8. [ ] HTTP HEAD로 Content-Type 검증 + 기존 설치본 자동 업데이트 확인
+9. [ ] (오프라인 배포 대상이면) USB 패키지 구성 — 6절
+
+## 6. 설치 경로 — 온라인 vs 오프라인(USB)
+
+설치 환경에 따라 두 경로가 있다. **둘 다 VCLibs가 필요**하지만 공급 방식이 다르다.
+
+### 온라인 (기본) — `.appinstaller` 자동 설치/업데이트
+
+- 사용자는 `https://scratch-link.aluxcoding.com/AluxLabsLink.appinstaller` 를 연다.
+- App Installer가 번들 + `<Dependencies>`의 VCLibs를 **호스트에서 자동 다운로드**해 설치하고, 이후 자동 업데이트까지 처리한다.
+- 전제: 인터넷 접근 + 호스트에 VCLibs 4개가 올라가 있을 것(4절). 둘 중 하나라도 빠지면 *"패키지 종속 파일을 설치하지 못했습니다"* 로 실패한다.
+
+### 오프라인 (보안망·학교 등) — USB sideload
+
+다운로드가 차단된 환경에서는 USB로 직접 설치한다. 이 경우 `.appinstaller`/번들 더블클릭은 VCLibs를 네트워크로 받으려다 실패하므로 **쓰지 않는다.** 대신 **번들 + VCLibs appx를 USB에 담아 로컬 파일로 함께 설치**한다.
+
+USB 폴더 구성:
+
+```
+AluxLabsLink-Install\
+├─ AluxLabs-Link-x.y.z.msixbundle          ← 서명된 운영 번들
+├─ Install-Offline.ps1
+└─ Dependencies\
+   ├─ Microsoft.VCLibs.x64.14.00.appx
+   ├─ Microsoft.VCLibs.x64.14.00.Desktop.appx
+   ├─ Microsoft.VCLibs.x86.14.00.appx
+   └─ Microsoft.VCLibs.x86.14.00.Desktop.appx
+```
+
+(VCLibs 원본은 레포 [`aluxlabs-link-win-msix/Dependencies/`](../../aluxlabs-link-win-msix/Dependencies/)에서 복사. 번들은 서명된 운영본.)
+
+설치(대상 PC에서):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install-Offline.ps1
+```
+
+[`Install-Offline.ps1`](../../aluxlabs-link-win-msix/Install-Offline.ps1)은 같은 폴더의 번들·VCLibs를 찾아 `Add-AppxPackage -Path <번들> -DependencyPath <VCLibs...>` 로 한 번에 오프라인 설치한다.
+
+**인증서**: 운영 번들은 Sectigo **OV**(공개 신뢰 CA `Sectigo Public Code Signing CA R36`) 서명이라 대상 PC에 `.cer`를 따로 등록할 필요가 없고, 대개 관리자 권한 없이 설치된다. (자체서명 LOCALTEST 번들일 때만 같은 폴더에 `.cer`를 두면 스크립트가 `Cert:\LocalMachine\TrustedPeople`에 등록 — 이 경우엔 관리자 권한 필요.)
+
+**한계**: 오프라인 설치본은 번들에 박힌 버전으로 **고정**되며 자동 업데이트가 동작하지 않는다(네트워크 차단). 갱신하려면 새 번들을 다시 USB로 배포한다.
