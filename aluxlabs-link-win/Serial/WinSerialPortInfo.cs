@@ -6,32 +6,32 @@
 namespace AluxLabs.Link.Win.Serial;
 
 /// <summary>
-/// A single port returned by <see cref="WinSerialPortEnumerator"/>.
+/// <see cref="WinSerialPortEnumerator"/>가 반환하는 포트 하나.
 /// </summary>
 internal class WinSerialPortInfo
 {
     /// <summary>
-    /// Gets or sets the OS-level port path (e.g. "COM7").
+    /// OS 수준 포트 경로(예: "COM7")를 가져오거나 설정한다.
     /// </summary>
     public string Path { get; set; }
 
     /// <summary>
-    /// Gets or sets a user-visible name (typically includes the COM number).
+    /// 사용자에게 보이는 이름(보통 COM 번호 포함)을 가져오거나 설정한다.
     /// </summary>
     public string DisplayName { get; set; }
 
     /// <summary>
-    /// Gets or sets the USB vendor ID, or null if not parseable.
+    /// USB 벤더 ID를 가져오거나 설정한다. 파싱 불가 시 null.
     /// </summary>
     public int? VendorId { get; set; }
 
     /// <summary>
-    /// Gets or sets the USB product ID, or null if not parseable.
+    /// USB 제품 ID를 가져오거나 설정한다. 파싱 불가 시 null.
     /// </summary>
     public int? ProductId { get; set; }
 
     /// <summary>
-    /// Gets or sets the raw PNPDeviceID, useful for surprise-removal matching.
+    /// 원본 PNPDeviceID를 가져오거나 설정한다. 갑작스러운 분리(surprise removal) 매칭에 유용하다.
     /// </summary>
     public string PnpDeviceId { get; set; }
 }

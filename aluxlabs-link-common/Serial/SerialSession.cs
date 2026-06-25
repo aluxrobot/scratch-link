@@ -18,36 +18,44 @@ using AluxLabs.Link.Extensions;
 using AluxLabs.Link.JsonRpc;
 
 /// <summary>
-/// Cross-platform base for a USB Serial transport session. Uses Serial-specific
-/// notification names (<c>serialDidReceiveData</c>, <c>serialDidDisconnect</c>)
-/// so callers cannot confuse Serial events with BLE characteristic events or
-/// BT message events.
+/// USB 시리얼 트랜스포트 세션의 크로스 플랫폼 베이스. 시리얼 전용 알림 이름
+/// (<c>serialDidReceiveData</c>, <c>serialDidDisconnect</c>)을 사용해
+/// 호출자가 시리얼 이벤트를 BLE 특성 이벤트나 BT 메시지 이벤트와 혼동하지 않게 한다.
 /// </summary>
-/// <typeparam name="TPort">Platform-specific port handle, passed back to <see cref="DoConnect(TPort, SerialOpenParams)"/>.</typeparam>
+/// <typeparam name="TPort">플랫폼별 포트 핸들. <see cref="DoConnect(TPort, SerialOpenParams)"/>로 다시 전달된다.</typeparam>
 internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     where TPort : class
 {
-    // Serializes DoWrite calls so two writes never overlap and corrupt the stream.
+    // 두 write가 겹쳐 스트림을 깨뜨리지 않도록 DoWrite 호출을 직렬화한다.
     private readonly SemaphoreSlim writeSemaphore = new SemaphoreSlim(1, 1);
 
-    // Guards keep-alive lifecycle fields shared with the timer callbacks.
+    // 타이머 콜백과 공유하는 keep-alive 수명 주기 필드를 보호한다.
     private readonly object stateLock = new object();
 
-    // The periodic packets the device requires; each runs on its own cadence timer. Guarded by stateLock.
+    // 장치가 요구하는 주기 패킷들; 각자 자체 주기 타이머로 돈다. stateLock으로 보호.
     private readonly List<KeepAliveEntry> keepAliveEntries = new ();
 
-    // Client writes and keep-alive packets awaiting a device read while paced; drained in FIFO order by FlushTxQueue.
+    // paced 동안 장치 수신을 기다리는 클라이언트 write와 keep-alive 패킷; FlushTxQueue가 FIFO 순으로 비운다.
     private readonly ConcurrentQueue<byte[]> txQueue = new ();
 
     private bool keepAliveActive;
 
-    // volatile so threads outside stateLock see the latest value on the hot path.
+    // hot path에서 stateLock 밖 스레드도 최신 값을 보도록 volatile.
     private volatile bool wireTrace;
 
-    // When set, TX is gated on device RX: writes queue instead of going out immediately. Configured at connect.
+    // 설정되면 TX가 장치 RX에 게이트된다: write가 즉시 나가지 않고 큐에 쌓인다. connect 시 구성.
     private volatile bool pacedWrite;
 
-    // Sent on a device read when the paced queue is empty; null disables the fallback. Configured at connect.
+    // 첫 장치 RX 후에만 게이팅이 arm되므로, connect 시점 write는 즉시 나가 주소를 받아야만 말하는 장치를 깨운다.
+    private volatile bool pacedArmed;
+
+    // 마지막으로 수락(=TX flush 트리거)한 RX의 Stopwatch 틱; 분할 판정 기준. await 이전 동기 구간에서만 접근해 레이스를 피한다.
+    private long lastAcceptedRxTs;
+
+    // 분할 패킷 판정용 장치 송신 주기(ms); 직전 수락 RX 후 이 값의 80% 미만에 온 RX는 분할로 보고 flush를 건너뛴다. 0이면 비활성. connect 시 구성.
+    private volatile int expectedRxPeriodMs;
+
+    // paced 큐가 비어 있을 때 장치 수신 시 보낸다; null이면 fallback 비활성화. connect 시 구성.
     private volatile byte[] idlePayload;
 
     /// <summary>
@@ -72,18 +80,17 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     /// <inheritdoc/>
     protected override string GeneratePeripheralId(string peripheralAddress)
     {
-        // A serial port path is stable and non-sensitive, so use it directly as the ID rather than an anonymized GUID.
+        // 시리얼 포트 경로는 안정적이고 민감하지 않으므로, 익명화 GUID 대신 그대로 ID로 쓴다.
         return peripheralAddress;
     }
 
     /// <summary>
-    /// Implement the JSON-RPC "discover" request. Parses the filter list and
-    /// kicks off platform-specific enumeration. Discovered ports are streamed
-    /// back via <see cref="OnPortDiscovered"/>.
+    /// JSON-RPC "discover" 요청을 구현한다. 필터 목록을 파싱하고 플랫폼별 열거를
+    /// 시작한다. 발견된 포트는 <see cref="OnPortDiscovered"/>로 스트리밍된다.
     /// </summary>
-    /// <param name="methodName">The name of the method being called ("discover").</param>
-    /// <param name="args">A JSON object optionally containing a <c>filters</c> array.</param>
-    /// <returns>A <see cref="Task"/> resolving to an empty result; discoveries are streamed via notifications.</returns>
+    /// <param name="methodName">호출되는 메서드 이름("discover").</param>
+    /// <param name="args">선택적으로 <c>filters</c> 배열을 담은 JSON 객체.</param>
+    /// <returns>빈 결과로 완료되는 <see cref="Task"/>; 발견 결과는 알림으로 스트리밍된다.</returns>
     protected async Task<object> HandleDiscover(string methodName, JsonElement? args)
     {
         var filters = ParseFilters(args);
@@ -100,19 +107,19 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Implement the JSON-RPC "listSerialPorts" request. Returns a one-shot snapshot of
-    /// currently matching ports in the response (no streamed notifications) and registers
-    /// each so a subsequent <c>connect</c> can resolve its peripheral ID.
+    /// JSON-RPC "listSerialPorts" 요청을 구현한다. 현재 일치하는 포트의 일회성 스냅샷을
+    /// 응답으로 반환하며(알림 스트리밍 없음), 이후 <c>connect</c>가 peripheral ID를 해석할 수
+    /// 있도록 각 포트를 등록한다.
     /// </summary>
-    /// <param name="methodName">The name of the method being called ("listSerialPorts").</param>
-    /// <param name="args">A JSON object optionally containing a <c>filters</c> array.</param>
-    /// <returns>A <see cref="Task"/> resolving to a <c>ports</c> array of the matching ports.</returns>
+    /// <param name="methodName">호출되는 메서드 이름("listSerialPorts").</param>
+    /// <param name="args">선택적으로 <c>filters</c> 배열을 담은 JSON 객체.</param>
+    /// <returns>일치하는 포트의 <c>ports</c> 배열로 완료되는 <see cref="Task"/>.</returns>
     protected async Task<object> HandleListSerialPorts(string methodName, JsonElement? args)
     {
         var filters = ParseFilters(args);
         Trace.WriteLine($"received listSerialPorts request with {filters.Count} filter(s)");
 
-        // Refresh the registry so an ID from a prior snapshot fails connect (-32600) instead of opening a vanished port.
+        // 레지스트리를 갱신해, 이전 스냅샷의 ID는 사라진 포트를 여는 대신 connect 실패(-32600)가 나게 한다.
         this.ClearDiscoveredPeripherals();
         var ports = await this.DoEnumeratePorts(filters);
 
@@ -134,11 +141,11 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Platform-specific one-shot enumeration of currently present serial ports matching
-    /// the filters. Returns a complete snapshot in one call; does not stream.
+    /// 필터에 일치하는, 현재 존재하는 시리얼 포트를 플랫폼별로 일회성 열거한다.
+    /// 한 번의 호출로 완전한 스냅샷을 반환하며 스트리밍하지 않는다.
     /// </summary>
-    /// <param name="filters">The filter list from the client. Empty means "match all".</param>
-    /// <returns>A <see cref="Task"/> resolving to the matching ports.</returns>
+    /// <param name="filters">클라이언트가 보낸 필터 목록. 비어 있으면 "전부 일치"를 뜻한다.</param>
+    /// <returns>일치하는 포트로 완료되는 <see cref="Task"/>.</returns>
     protected abstract Task<IReadOnlyList<EnumeratedPort>> DoEnumeratePorts(IReadOnlyList<SerialDiscoveryFilter> filters);
 
     /// <inheritdoc/>
@@ -153,34 +160,36 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         this.txQueue.Clear();
         this.pacedWrite = openParams.PacedWrite;
+        this.pacedArmed = false;
+        this.lastAcceptedRxTs = 0;
+        this.expectedRxPeriodMs = openParams.ExpectedRxPeriodMs;
         this.idlePayload = openParams.IdlePayload;
         if (this.pacedWrite)
         {
-            Trace.WriteLine("paced-write: TX queued, flushed on device RX");
+            Trace.WriteLine("paced-write: requested; gating arms on first device RX");
         }
 
-        // Configure before the platform DoConnect starts the timers so the first tick already sees the entries.
+        // 플랫폼 DoConnect가 타이머를 시작하기 전에 구성해, 첫 틱이 이미 항목들을 보게 한다.
         this.ConfigureKeepAlive(openParams.KeepAlive);
 
         return this.DoConnect(port, openParams);
     }
 
     /// <summary>
-    /// Platform-specific implementation for opening the given port. On success,
-    /// RX should be active and incoming bytes should be reported via
-    /// <see cref="DidReceiveData"/>.
+    /// 주어진 포트를 여는 플랫폼별 구현. 성공 시 RX가 활성화되어야 하며,
+    /// 들어오는 바이트는 <see cref="DidReceiveData"/>로 보고되어야 한다.
     /// </summary>
-    /// <param name="port">The port handle previously registered via <see cref="OnPortDiscovered"/>.</param>
-    /// <param name="openParams">Open parameters extracted from the connect request.</param>
-    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <param name="port"><see cref="OnPortDiscovered"/>로 미리 등록된 포트 핸들.</param>
+    /// <param name="openParams">connect 요청에서 추출한 open 파라미터.</param>
+    /// <returns>비동기 작업을 나타내는 <see cref="Task"/>.</returns>
     protected abstract Task<object> DoConnect(TPort port, SerialOpenParams openParams);
 
     /// <summary>
-    /// JSON-RPC <c>write</c> handler. Sends a client message to the serial line under the write lock.
+    /// JSON-RPC <c>write</c> 핸들러. write 락 하에서 클라이언트 메시지를 시리얼 라인으로 보낸다.
     /// </summary>
-    /// <param name="methodName">Dispatched method name.</param>
-    /// <param name="args">Decoded request params.</param>
-    /// <returns><c>sentBytes</c> wrapper.</returns>
+    /// <param name="methodName">디스패치된 메서드 이름.</param>
+    /// <param name="args">디코딩된 요청 파라미터.</param>
+    /// <returns><c>sentBytes</c> 래퍼.</returns>
     protected async Task<object> HandleWrite(string methodName, JsonElement? args)
     {
         if (args == null)
@@ -190,7 +199,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         var buffer = EncodingHelpers.DecodeBuffer(args.Value);
 
-        if (this.pacedWrite)
+        if (this.pacedWrite && this.pacedArmed)
         {
             if (this.wireTrace)
             {
@@ -221,20 +230,19 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Platform-specific implementation for sending bytes to the port.
+    /// 포트로 바이트를 보내는 플랫폼별 구현.
     /// </summary>
-    /// <param name="data">The bytes to send.</param>
-    /// <returns>The number of bytes actually written.</returns>
+    /// <param name="data">보낼 바이트.</param>
+    /// <returns>실제로 기록된 바이트 수.</returns>
     protected abstract Task<int> DoWrite(byte[] data);
 
     /// <summary>
-    /// Implement the JSON-RPC "disconnect" request. Closes the port without
-    /// firing a <c>serialDidDisconnect</c> notification (that is reserved for
-    /// external-cause disconnects).
+    /// JSON-RPC "disconnect" 요청을 구현한다. <c>serialDidDisconnect</c> 알림을 내보내지 않고
+    /// 포트를 닫는다(그 알림은 외부 원인 disconnect 전용이다).
     /// </summary>
-    /// <param name="methodName">The name of the method being called ("disconnect").</param>
-    /// <param name="args">Unused.</param>
-    /// <returns>An empty result.</returns>
+    /// <param name="methodName">호출되는 메서드 이름("disconnect").</param>
+    /// <param name="args">사용하지 않음.</param>
+    /// <returns>빈 결과.</returns>
     protected async Task<object> HandleDisconnect(string methodName, JsonElement? args)
     {
         await this.DoDisconnect();
@@ -242,43 +250,43 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Platform-specific implementation for closing the port.
+    /// 포트를 닫는 플랫폼별 구현.
     /// </summary>
-    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <returns>비동기 작업을 나타내는 <see cref="Task"/>.</returns>
     protected abstract Task DoDisconnect();
 
     /// <summary>
-    /// Implement the JSON-RPC "startReading" request. RX is enabled automatically
-    /// on connect, so the default implementation is a no-op. Subclasses may
-    /// override to re-enable RX after a <c>stopReading</c>.
+    /// JSON-RPC "startReading" 요청을 구현한다. RX는 connect 시 자동으로 켜지므로
+    /// 기본 구현은 no-op이다. 서브클래스는 <c>stopReading</c> 이후 RX를 다시 켜기 위해
+    /// 오버라이드할 수 있다.
     /// </summary>
-    /// <param name="methodName">The name of the method being called ("startReading").</param>
-    /// <param name="args">Unused.</param>
-    /// <returns>An empty result.</returns>
+    /// <param name="methodName">호출되는 메서드 이름("startReading").</param>
+    /// <param name="args">사용하지 않음.</param>
+    /// <returns>빈 결과.</returns>
     protected virtual Task<object> HandleStartReading(string methodName, JsonElement? args)
     {
         return Task.FromResult<object>(new Dictionary<string, object>());
     }
 
     /// <summary>
-    /// Implement the JSON-RPC "stopReading" request. Default is a no-op.
+    /// JSON-RPC "stopReading" 요청을 구현한다. 기본은 no-op이다.
     /// </summary>
-    /// <param name="methodName">The name of the method being called ("stopReading").</param>
-    /// <param name="args">Unused.</param>
-    /// <returns>An empty result.</returns>
+    /// <param name="methodName">호출되는 메서드 이름("stopReading").</param>
+    /// <param name="args">사용하지 않음.</param>
+    /// <returns>빈 결과.</returns>
     protected virtual Task<object> HandleStopReading(string methodName, JsonElement? args)
     {
         return Task.FromResult<object>(new Dictionary<string, object>());
     }
 
     /// <summary>
-    /// JSON-RPC <c>setKeepAlive</c> handler. Toggles the whole keep-alive timer set on or off:
-    /// a positive <c>intervalMs</c> resumes every configured entry on its own cadence; null/0/negative pauses all.
-    /// Idempotent (stop-then-start). Response echoes the applied value (null when paused).
+    /// JSON-RPC <c>setKeepAlive</c> 핸들러. keep-alive 타이머 집합 전체를 켜거나 끈다:
+    /// 양수 <c>intervalMs</c>는 구성된 모든 항목을 각자 주기로 재개하고, null/0/음수는 전부 일시정지한다.
+    /// 멱등(stop 후 start)하다. 응답은 적용된 값을 echo한다(정지 시 null).
     /// </summary>
-    /// <param name="methodName">Dispatched method name.</param>
-    /// <param name="args">Decoded request params.</param>
-    /// <returns>Echo of the applied value.</returns>
+    /// <param name="methodName">디스패치된 메서드 이름.</param>
+    /// <param name="args">디코딩된 요청 파라미터.</param>
+    /// <returns>적용된 값의 echo.</returns>
     protected Task<object> HandleSetKeepAlive(string methodName, JsonElement? args)
     {
         int? requested = null;
@@ -291,7 +299,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             }
         }
 
-        // Stop-then-start makes the call idempotent regardless of current state.
+        // stop 후 start로, 현재 상태와 무관하게 호출을 멱등으로 만든다.
         this.StopKeepAlive();
 
         int? applied = null;
@@ -307,13 +315,13 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// JSON-RPC <c>setKeepAlivePayload</c> handler. Replaces the payload of one configured entry at runtime so a
-    /// dynamic packet stays current; the cadence is unchanged and the next tick sends the new bytes. An unknown id
-    /// leaves every entry untouched and reports <c>applied: false</c>.
+    /// JSON-RPC <c>setKeepAlivePayload</c> 핸들러. 동적 패킷이 최신을 유지하도록 구성된 항목 하나의 페이로드를
+    /// 런타임에 교체한다; 주기는 그대로이고 다음 틱이 새 바이트를 보낸다. 알 수 없는 id면 모든 항목을 건드리지 않고
+    /// <c>applied: false</c>를 보고한다.
     /// </summary>
-    /// <param name="methodName">Dispatched method name.</param>
-    /// <param name="args">Decoded request params.</param>
-    /// <returns>Echo of the id and whether it matched a configured entry.</returns>
+    /// <param name="methodName">디스패치된 메서드 이름.</param>
+    /// <param name="args">디코딩된 요청 파라미터.</param>
+    /// <returns>id와 구성된 항목에 일치했는지 여부의 echo.</returns>
     protected Task<object> HandleSetKeepAlivePayload(string methodName, JsonElement? args)
     {
         var id = args?.TryGetProperty("id")?.GetString();
@@ -338,18 +346,17 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             }
         }
 
-        Trace.WriteLine($"keep-alive: setKeepAlivePayload id={id} applied={applied}");
         return Task.FromResult<object>(new Dictionary<string, object> { ["id"] = id, ["applied"] = applied });
     }
 
     /// <summary>
-    /// JSON-RPC <c>setPacedWrite</c> handler. Switches device-RX-gated write queuing on or off at runtime. Disable it
-    /// before a raw request-response sequence (e.g. a bootloader firmware update) so writes go out immediately and
-    /// unbuffered. Toggling either way discards any queued packets. Response echoes the applied state.
+    /// JSON-RPC <c>setPacedWrite</c> 핸들러. 장치-RX 게이트 write 큐잉을 런타임에 켜거나 끈다. raw 요청-응답
+    /// 시퀀스(예: 부트로더 펌웨어 업데이트) 전에는 꺼서 write가 버퍼링 없이 즉시 나가게 한다. 어느 쪽으로 토글하든
+    /// 큐에 쌓인 패킷은 폐기된다. 응답은 적용된 상태를 echo한다.
     /// </summary>
-    /// <param name="methodName">Dispatched method name.</param>
-    /// <param name="args">Decoded request params.</param>
-    /// <returns>Echo of the applied state.</returns>
+    /// <param name="methodName">디스패치된 메서드 이름.</param>
+    /// <param name="args">디코딩된 요청 파라미터.</param>
+    /// <returns>적용된 상태의 echo.</returns>
     protected Task<object> HandleSetPacedWrite(string methodName, JsonElement? args)
     {
         var enabled = args?.TryGetProperty("enabled")?.GetBoolean();
@@ -359,6 +366,8 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         }
 
         this.pacedWrite = enabled.Value;
+        this.pacedArmed = false;
+        this.lastAcceptedRxTs = 0;
         this.txQueue.Clear();
 
         Trace.WriteLine($"paced-write: setPacedWrite enabled={enabled.Value}");
@@ -366,12 +375,12 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// JSON-RPC <c>triggerDTRReset</c> handler. Acquires the write semaphore so no
-    /// write overlaps the DTR pulse sequence, then delegates to <see cref="DoTriggerDTRReset"/>.
+    /// JSON-RPC <c>triggerDTRReset</c> 핸들러. write가 DTR 펄스 시퀀스와 겹치지 않도록 write 세마포어를
+    /// 획득한 뒤 <see cref="DoTriggerDTRReset"/>에 위임한다.
     /// </summary>
-    /// <param name="methodName">Dispatched method name.</param>
-    /// <param name="args">Unused.</param>
-    /// <returns>An empty result, returned after the DTR pulse sequence completes.</returns>
+    /// <param name="methodName">디스패치된 메서드 이름.</param>
+    /// <param name="args">사용하지 않음.</param>
+    /// <returns>DTR 펄스 시퀀스 완료 후 반환되는 빈 결과.</returns>
     protected async Task<object> HandleTriggerDTRReset(string methodName, JsonElement? args)
     {
         Trace.WriteLine("triggerDTRReset: executing DTR pulse");
@@ -390,24 +399,47 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Platform-specific implementation for the DTR reset pulse. Asserts DTR for 50 ms
-    /// then releases it. Must throw <see cref="JsonRpc2Exception"/> on failure so the
-    /// caller receives a well-formed JSON-RPC error response.
+    /// DTR 리셋 펄스의 플랫폼별 구현. DTR을 50ms 동안 assert한 뒤 해제한다. 실패 시
+    /// 호출자가 올바른 형식의 JSON-RPC 에러 응답을 받도록 <see cref="JsonRpc2Exception"/>을 던져야 한다.
     /// </summary>
-    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <returns>비동기 작업을 나타내는 <see cref="Task"/>.</returns>
     protected abstract Task DoTriggerDTRReset();
 
     /// <summary>
-    /// Report received bytes to the client as a <c>serialDidReceiveData</c>
-    /// notification. The payload is base64-encoded.
+    /// 수신한 바이트를 <c>serialDidReceiveData</c> 알림으로 클라이언트에 보고한다.
+    /// 페이로드는 base64로 인코딩된다.
     /// </summary>
-    /// <param name="data">The bytes received.</param>
-    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <param name="data">수신한 바이트.</param>
+    /// <returns>비동기 작업을 나타내는 <see cref="Task"/>.</returns>
     protected async Task DidReceiveData(byte[] data)
     {
+        var rxAt = Stopwatch.GetTimestamp();
         if (this.wireTrace)
         {
             Trace.WriteLine($"wire-trace RX {data.Length}B {FormatHex(data)}");
+        }
+
+        if (this.pacedWrite && !this.pacedArmed)
+        {
+            this.pacedArmed = true;
+            Trace.WriteLine("paced-write: armed on first device RX");
+        }
+
+        // 분할 판정·기준 갱신을 await 이전(동기 구간)에서 끝낸다. RX 보고는 순차적이라 근접한 두 RX가 같은 기준으로 경쟁하지 않는다.
+        var flush = this.pacedWrite && this.pacedArmed;
+        if (flush)
+        {
+            var period = this.expectedRxPeriodMs;
+            var lastAccepted = this.lastAcceptedRxTs;
+            if (period > 0 && lastAccepted != 0 &&
+                (rxAt - lastAccepted) / (Stopwatch.Frequency / 1000.0) < period * 0.8)
+            {
+                flush = false;
+            }
+            else
+            {
+                this.lastAcceptedRxTs = rxAt;
+            }
         }
 
         var encoded = EncodingHelpers.EncodeBuffer(data, "base64");
@@ -418,20 +450,19 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             Message = encoded,
         });
 
-        if (this.pacedWrite)
+        if (flush)
         {
             await this.FlushTxQueue();
         }
     }
 
     /// <summary>
-    /// Report an external-cause disconnect to the client as a
-    /// <c>serialDidDisconnect</c> notification. Does not fire for the
-    /// client-initiated <c>disconnect</c> request.
+    /// 외부 원인 disconnect를 <c>serialDidDisconnect</c> 알림으로 클라이언트에 보고한다.
+    /// 클라이언트가 시작한 <c>disconnect</c> 요청에는 발화하지 않는다.
     /// </summary>
-    /// <param name="reason">One of "user", "device", "error", "shutdown".</param>
-    /// <param name="message">Optional human-readable detail.</param>
-    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <param name="reason">"user", "device", "error", "shutdown" 중 하나.</param>
+    /// <param name="message">선택적인 사람이 읽을 수 있는 상세.</param>
+    /// <returns>비동기 작업을 나타내는 <see cref="Task"/>.</returns>
     protected async Task DidDisconnect(string reason, string message = null)
     {
         await this.SendNotification("serialDidDisconnect", new SerialDisconnectMessage
@@ -442,16 +473,16 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Track a discovered port and report it to the client. Uses
-    /// <see cref="PeripheralSession{TPort, String}.RegisterPeripheral"/> to
-    /// obtain a session-scoped peripheral ID.
+    /// 발견한 포트를 추적하고 클라이언트에 보고한다.
+    /// <see cref="PeripheralSession{TPort, String}.RegisterPeripheral"/>로
+    /// 세션 범위 peripheral ID를 얻는다.
     /// </summary>
-    /// <param name="port">Platform-specific port handle.</param>
-    /// <param name="path">OS-level port path used as the address (e.g. "COM7").</param>
-    /// <param name="displayName">User-visible name, may include the path.</param>
-    /// <param name="vendorIdHex">Vendor ID as a hex string (e.g. "0x1A86"), or null.</param>
-    /// <param name="productIdHex">Product ID as a hex string (e.g. "0x7523"), or null.</param>
-    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <param name="port">플랫폼별 포트 핸들.</param>
+    /// <param name="path">주소로 쓰이는 OS 수준 포트 경로(예: "COM7").</param>
+    /// <param name="displayName">사용자에게 보이는 이름. 경로를 포함할 수 있다.</param>
+    /// <param name="vendorIdHex">16진 문자열 벤더 ID(예: "0x1A86"), 또는 null.</param>
+    /// <param name="productIdHex">16진 문자열 제품 ID(예: "0x7523"), 또는 null.</param>
+    /// <returns>비동기 작업을 나타내는 <see cref="Task"/>.</returns>
     protected async Task OnPortDiscovered(TPort port, string path, string displayName, string vendorIdHex, string productIdHex)
     {
         var peripheralId = this.RegisterPeripheral(port, path);
@@ -468,10 +499,10 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Replace the configured keep-alive entry set. Does not start timers; the platform layer calls
-    /// <see cref="StartKeepAlive"/> once the port is open.
+    /// 구성된 keep-alive 항목 집합을 교체한다. 타이머를 시작하지 않으며, 포트가 열리면 플랫폼 계층이
+    /// <see cref="StartKeepAlive"/>를 호출한다.
     /// </summary>
-    /// <param name="entries">The periodic packets the device requires, or null/empty to disable keep-alive.</param>
+    /// <param name="entries">장치가 요구하는 주기 패킷들. null/빈 목록이면 keep-alive를 비활성화한다.</param>
     protected void ConfigureKeepAlive(IReadOnlyList<KeepAliveEntryParam> entries)
     {
         lock (this.stateLock)
@@ -490,7 +521,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Start a cadence timer for every configured entry. No-op if already running or if nothing is configured.
+    /// 구성된 모든 항목에 대해 주기 타이머를 시작한다. 이미 실행 중이거나 구성된 게 없으면 no-op.
     /// </summary>
     protected void StartKeepAlive()
     {
@@ -517,8 +548,8 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Stop and dispose every entry's timer, blocking until any in-flight tick finishes. Keeps the configured
-    /// entries so a later <see cref="StartKeepAlive"/> can resume them. Safe to call repeatedly.
+    /// 모든 항목의 타이머를 정지·해제하며, in-flight 틱이 끝날 때까지 블록한다. 이후 <see cref="StartKeepAlive"/>가
+    /// 재개할 수 있도록 구성된 항목은 유지한다. 반복 호출해도 안전하다.
     /// </summary>
     protected void StopKeepAlive()
     {
@@ -544,7 +575,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         foreach (var timer in toDispose)
         {
-            // Block so no send races a subsequent disconnect or port disposal.
+            // 후속 disconnect나 포트 해제와 send가 레이스하지 않도록 블록한다.
             using var waitHandle = new ManualResetEvent(false);
             if (timer.Dispose(waitHandle))
             {
@@ -560,7 +591,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     {
         if (disposing && !this.DisposedValue)
         {
-            // Order matters: StopKeepAlive waits for in-flight ticks before we dispose the semaphore they use.
+            // 순서 중요: StopKeepAlive가 in-flight 틱을 기다린 뒤에 그 틱이 쓰는 세마포어를 해제한다.
             this.StopKeepAlive();
             this.writeSemaphore.Dispose();
         }
@@ -615,6 +646,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             KeepAlive = ParseKeepAlive(args),
             PacedWrite = args?.TryGetProperty("pacedWrite")?.GetBoolean() ?? false,
             IdlePayload = DecodeBase64Payload(args?.TryGetProperty("idlePayload")?.GetString()),
+            ExpectedRxPeriodMs = args?.TryGetProperty("expectedRxPeriodMs")?.GetInt32() ?? 0,
             WireTrace = args?.TryGetProperty("wireTrace")?.GetBoolean() ?? false,
         };
     }
@@ -677,7 +709,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Hex preview for diagnostic logs, capped at <paramref name="maxBytes"/> with a tail marker.
+    /// 진단 로그용 16진 미리보기. <paramref name="maxBytes"/>에서 잘리고 꼬리 마커가 붙는다.
     /// </summary>
     private static string FormatHex(byte[] data, int maxBytes = 256)
     {
@@ -711,10 +743,10 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         await this.writeSemaphore.WaitAsync().ConfigureAwait(false);
         try
         {
-            var sentAny = false;
+            var sentCount = 0;
             while (this.txQueue.TryDequeue(out var packet))
             {
-                sentAny = true;
+                sentCount++;
                 if (this.wireTrace)
                 {
                     Trace.WriteLine($"wire-trace TX(flush) {packet.Length}B {FormatHex(packet)}");
@@ -724,7 +756,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             }
 
             var idle = this.idlePayload;
-            if (!sentAny && idle != null && idle.Length > 0)
+            if (sentCount == 0 && idle != null && idle.Length > 0)
             {
                 if (this.wireTrace)
                 {
@@ -736,7 +768,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         }
         catch (Exception e)
         {
-            // DidReceiveData is fire-and-forget, so an escaped exception would go unobserved; log and stop the flush.
+            // DidReceiveData는 fire-and-forget이라 빠져나간 예외가 관측되지 않는다; 로그 남기고 flush를 멈춘다.
             Trace.WriteLine($"paced flush failed: {e.GetType().Name}: {e.Message}");
         }
         finally
@@ -747,7 +779,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             }
             catch (ObjectDisposedException)
             {
-                // Semaphore disposed during shutdown.
+                // 종료 중 세마포어가 해제됨.
             }
         }
     }
@@ -772,14 +804,14 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             return;
         }
 
-        // In paced mode the device read gates all TX, so periodic packets join the queue rather than going out now.
-        if (this.pacedWrite)
+        // arm되면 장치 읽기가 모든 TX를 게이트하므로, 주기 패킷도 지금 나가지 않고 큐에 합류한다.
+        if (this.pacedWrite && this.pacedArmed)
         {
             this.txQueue.Enqueue(data);
             return;
         }
 
-        // WaitAsync(0) makes the tick idle-only: during a write burst the semaphore is busy and we no-op.
+        // WaitAsync(0)으로 틱을 idle 전용으로 만든다: write 버스트 중엔 세마포어가 바빠서 no-op.
         if (!await this.writeSemaphore.WaitAsync(0).ConfigureAwait(false))
         {
             return;
@@ -801,11 +833,11 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
         }
         catch (ObjectDisposedException)
         {
-            // Session disposed mid-tick.
+            // 틱 도중 세션이 해제됨.
         }
         catch (Exception e)
         {
-            // async-void Timer callback: an escaped exception terminates the process, so log and move on.
+            // async-void Timer 콜백: 빠져나간 예외는 프로세스를 종료시키므로, 로그 남기고 넘어간다.
             Trace.WriteLine($"keep-alive[{entry.Id}]: send failed: {e.GetType().Name}: {e.Message}");
         }
         finally
@@ -816,43 +848,43 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             }
             catch (ObjectDisposedException)
             {
-                // Semaphore disposed during shutdown.
+                // 종료 중 세마포어가 해제됨.
             }
         }
     }
 
     /// <summary>
-    /// Payload of a <c>serialDidReceiveData</c> notification.
+    /// <c>serialDidReceiveData</c> 알림의 페이로드.
     /// </summary>
     protected class SerialDataReceived
     {
         /// <summary>
-        /// Gets or sets the encoding identifier; always "base64" for serial RX.
+        /// 인코딩 식별자를 가져오거나 설정한다; 시리얼 RX는 항상 "base64".
         /// </summary>
         [JsonPropertyName("encoding")]
         public string Encoding { get; set; }
 
         /// <summary>
-        /// Gets or sets the encoded payload.
+        /// 인코딩된 페이로드를 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("message")]
         public string Message { get; set; }
     }
 
     /// <summary>
-    /// Payload of a <c>serialDidDisconnect</c> notification.
+    /// <c>serialDidDisconnect</c> 알림의 페이로드.
     /// </summary>
     protected class SerialDisconnectMessage
     {
         /// <summary>
-        /// Gets or sets the disconnect reason: "user", "device", "error", or "shutdown".
+        /// disconnect 원인을 가져오거나 설정한다: "user", "device", "error", "shutdown".
         /// </summary>
         [JsonPropertyName("reason")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string Reason { get; set; }
 
         /// <summary>
-        /// Gets or sets an optional human-readable detail message.
+        /// 선택적인 사람이 읽을 수 있는 상세 메시지를 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("message")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -860,63 +892,63 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
     }
 
     /// <summary>
-    /// Payload of a <c>didDiscoverPeripheral</c> notification on the serial transport.
+    /// 시리얼 트랜스포트의 <c>didDiscoverPeripheral</c> 알림 페이로드.
     /// </summary>
     protected class SerialPortDiscovered
     {
         /// <summary>
-        /// Gets or sets the session-scoped peripheral ID used by the client to connect.
+        /// 클라이언트가 연결에 사용하는 세션 범위 peripheral ID를 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("peripheralId")]
         public string PeripheralId { get; set; }
 
         /// <summary>
-        /// Gets or sets the user-visible name of the port.
+        /// 포트의 사용자에게 보이는 이름을 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("name")]
         public string Name { get; set; }
 
         /// <summary>
-        /// Gets or sets the OS-level port path (e.g. "COM7").
+        /// OS 수준 포트 경로(예: "COM7")를 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("path")]
         public string Path { get; set; }
 
         /// <summary>
-        /// Gets or sets the USB vendor ID as a hex string (e.g. "0x1A86"), if known.
+        /// USB 벤더 ID를 16진 문자열(예: "0x1A86")로, 알려진 경우 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("vendorId")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string VendorId { get; set; }
 
         /// <summary>
-        /// Gets or sets the USB product ID as a hex string (e.g. "0x7523"), if known.
+        /// USB 제품 ID를 16진 문자열(예: "0x7523")로, 알려진 경우 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("productId")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string ProductId { get; set; }
 
         /// <summary>
-        /// Gets or sets a placeholder RSSI value for cross-transport message compatibility.
+        /// 트랜스포트 간 메시지 호환을 위한 플레이스홀더 RSSI 값을 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("rssi")]
         public int RSSI { get; set; }
     }
 
     /// <summary>
-    /// A single port returned by <see cref="DoEnumeratePorts"/>, pairing the platform
-    /// port handle with the display metadata needed to report it.
+    /// <see cref="DoEnumeratePorts"/>가 반환하는 포트 하나. 플랫폼 포트 핸들과
+    /// 보고에 필요한 표시 메타데이터를 묶는다.
     /// </summary>
     protected sealed class EnumeratedPort
     {
         /// <summary>
         /// Initializes a new instance of the <see cref="EnumeratedPort"/> class.
         /// </summary>
-        /// <param name="port">The platform-specific port handle.</param>
-        /// <param name="path">The OS-level port path (e.g. "COM7").</param>
-        /// <param name="displayName">The user-visible name.</param>
-        /// <param name="vendorIdHex">The USB vendor ID as a hex string, or null.</param>
-        /// <param name="productIdHex">The USB product ID as a hex string, or null.</param>
+        /// <param name="port">플랫폼별 포트 핸들.</param>
+        /// <param name="path">OS 수준 포트 경로(예: "COM7").</param>
+        /// <param name="displayName">사용자에게 보이는 이름.</param>
+        /// <param name="vendorIdHex">16진 문자열 USB 벤더 ID, 또는 null.</param>
+        /// <param name="productIdHex">16진 문자열 USB 제품 ID, 또는 null.</param>
         public EnumeratedPort(TPort port, string path, string displayName, string vendorIdHex, string productIdHex)
         {
             this.Port = port;
@@ -926,68 +958,68 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             this.ProductIdHex = productIdHex;
         }
 
-        /// <summary>Gets the platform-specific port handle.</summary>
+        /// <summary>플랫폼별 포트 핸들을 가져온다.</summary>
         public TPort Port { get; }
 
-        /// <summary>Gets the OS-level port path.</summary>
+        /// <summary>OS 수준 포트 경로를 가져온다.</summary>
         public string Path { get; }
 
-        /// <summary>Gets the user-visible name.</summary>
+        /// <summary>사용자에게 보이는 이름을 가져온다.</summary>
         public string DisplayName { get; }
 
-        /// <summary>Gets the USB vendor ID as a hex string, or null.</summary>
+        /// <summary>16진 문자열 USB 벤더 ID, 또는 null을 가져온다.</summary>
         public string VendorIdHex { get; }
 
-        /// <summary>Gets the USB product ID as a hex string, or null.</summary>
+        /// <summary>16진 문자열 USB 제품 ID, 또는 null을 가져온다.</summary>
         public string ProductIdHex { get; }
     }
 
     /// <summary>
-    /// Payload of a <c>listSerialPorts</c> response.
+    /// <c>listSerialPorts</c> 응답의 페이로드.
     /// </summary>
     protected class SerialPortListResult
     {
         /// <summary>
-        /// Gets or sets the snapshot of currently matching ports.
+        /// 현재 일치하는 포트의 스냅샷을 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("ports")]
         public List<SerialPortListItem> Ports { get; set; }
     }
 
     /// <summary>
-    /// A single entry in a <c>listSerialPorts</c> response. Mirrors the
-    /// <c>didDiscoverPeripheral</c> fields without the RSSI placeholder.
+    /// <c>listSerialPorts</c> 응답의 항목 하나. RSSI 플레이스홀더를 뺀
+    /// <c>didDiscoverPeripheral</c> 필드를 그대로 반영한다.
     /// </summary>
     protected class SerialPortListItem
     {
         /// <summary>
-        /// Gets or sets the peripheral ID used by the client to connect.
+        /// 클라이언트가 연결에 사용하는 peripheral ID를 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("peripheralId")]
         public string PeripheralId { get; set; }
 
         /// <summary>
-        /// Gets or sets the user-visible name of the port.
+        /// 포트의 사용자에게 보이는 이름을 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("name")]
         public string Name { get; set; }
 
         /// <summary>
-        /// Gets or sets the OS-level port path (e.g. "COM7").
+        /// OS 수준 포트 경로(예: "COM7")를 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("path")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string Path { get; set; }
 
         /// <summary>
-        /// Gets or sets the USB vendor ID as a hex string, if known.
+        /// USB 벤더 ID를 16진 문자열로, 알려진 경우 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("vendorId")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public string VendorId { get; set; }
 
         /// <summary>
-        /// Gets or sets the USB product ID as a hex string, if known.
+        /// USB 제품 ID를 16진 문자열로, 알려진 경우 가져오거나 설정한다.
         /// </summary>
         [JsonPropertyName("productId")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -1007,10 +1039,10 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
 
         public int IntervalMs { get; }
 
-        // Mutable so setKeepAlivePayload can refresh a dynamic packet; guarded by stateLock.
+        // setKeepAlivePayload가 동적 패킷을 갱신할 수 있도록 가변; stateLock으로 보호.
         public byte[] Payload { get; set; }
 
-        // Created by StartKeepAlive, nulled and disposed by StopKeepAlive; guarded by stateLock.
+        // StartKeepAlive가 생성하고 StopKeepAlive가 null 처리·해제; stateLock으로 보호.
         public Timer Timer { get; set; }
     }
 }

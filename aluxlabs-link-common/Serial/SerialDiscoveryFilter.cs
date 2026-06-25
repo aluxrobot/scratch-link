@@ -6,23 +6,23 @@
 namespace AluxLabs.Link.Serial;
 
 /// <summary>
-/// A single filter entry passed by the client in a serial "discover" request.
-/// A port is reported when it matches any filter in the list.
+/// 클라이언트가 시리얼 "discover" 요청에 담아 보내는 필터 항목 하나.
+/// 목록 안의 어느 필터든 일치하면 해당 포트가 보고된다.
 /// </summary>
 internal class SerialDiscoveryFilter
 {
     /// <summary>
-    /// Gets or sets the USB vendor ID to match, as a decimal integer.
+    /// 매칭할 USB 벤더 ID를 10진 정수로 가져오거나 설정한다.
     /// </summary>
     public int? UsbVendorId { get; set; }
 
     /// <summary>
-    /// Gets or sets the USB product ID to match, as a decimal integer.
+    /// 매칭할 USB 제품 ID를 10진 정수로 가져오거나 설정한다.
     /// </summary>
     public int? UsbProductId { get; set; }
 
     /// <summary>
-    /// Gets or sets an optional port path substring to match (e.g. "COM7").
+    /// 매칭할 포트 경로 부분 문자열(예: "COM7")을 가져오거나 설정한다. 선택 사항이다.
     /// </summary>
     public string PathHint { get; set; }
 }
