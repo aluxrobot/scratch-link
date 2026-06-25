@@ -14,9 +14,8 @@ using System.Text.RegularExpressions;
 using AluxLabs.Link.Serial;
 
 /// <summary>
-/// Enumerates USB serial ports on Windows via WMI (Win32_PnPEntity), extracting
-/// the COM port name plus USB VID/PID from the PNPDeviceID. Used by
-/// <see cref="WinSerialSession"/> for discovery.
+/// WMI(Win32_PnPEntity)로 Windows의 USB 시리얼 포트를 열거하며, PNPDeviceID에서
+/// COM 포트 이름과 USB VID/PID를 추출한다. <see cref="WinSerialSession"/>이 검색에 사용한다.
 /// </summary>
 internal static class WinSerialPortEnumerator
 {
@@ -33,10 +32,10 @@ internal static class WinSerialPortEnumerator
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>
-    /// Synchronously query WMI for USB serial ports matching any of the given filters.
+    /// 주어진 필터 중 하나라도 일치하는 USB 시리얼 포트를 WMI로 동기 조회한다.
     /// </summary>
-    /// <param name="filters">Filter list. Empty means "return all matching USB serial ports".</param>
-    /// <returns>List of matching ports. May be empty.</returns>
+    /// <param name="filters">필터 목록. 비어 있으면 "일치하는 모든 USB 시리얼 포트 반환"을 뜻한다.</param>
+    /// <returns>일치하는 포트 목록. 비어 있을 수 있다.</returns>
     public static IReadOnlyList<WinSerialPortInfo> Query(IReadOnlyList<SerialDiscoveryFilter> filters)
     {
         var results = new List<WinSerialPortInfo>();
@@ -84,7 +83,7 @@ internal static class WinSerialPortEnumerator
         var comMatch = ComPortRegex.Match(caption);
         if (!comMatch.Success)
         {
-            // No COM port number means this isn't a usable serial port from our point of view.
+            // COM 포트 번호가 없으면 우리 관점에선 사용 가능한 시리얼 포트가 아니다.
             return null;
         }
 

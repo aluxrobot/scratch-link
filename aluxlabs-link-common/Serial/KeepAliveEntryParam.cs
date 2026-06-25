@@ -6,22 +6,22 @@
 namespace AluxLabs.Link.Serial;
 
 /// <summary>
-/// One keep-alive entry parsed from a connect request: an opaque periodic packet plus its send cadence.
+/// connect 요청에서 파싱된 keep-alive 항목 하나. 불투명한 주기 패킷과 그 송신 주기로 구성된다.
 /// </summary>
 internal sealed class KeepAliveEntryParam
 {
     /// <summary>
-    /// Gets or sets the client-assigned id used to target this entry in a later <c>setKeepAlivePayload</c>.
+    /// 이후 <c>setKeepAlivePayload</c>에서 이 항목을 지정할 때 쓰는, 클라이언트가 부여한 id를 가져오거나 설정한다.
     /// </summary>
     public string Id { get; set; }
 
     /// <summary>
-    /// Gets or sets the bytes written to the serial line on each cadence tick. May be null until first set.
+    /// 매 주기 틱마다 시리얼 라인에 기록되는 바이트를 가져오거나 설정한다. 최초 설정 전까지는 null일 수 있다.
     /// </summary>
     public byte[] Payload { get; set; }
 
     /// <summary>
-    /// Gets or sets the send cadence in milliseconds. Must be positive.
+    /// 송신 주기(밀리초)를 가져오거나 설정한다. 양수여야 한다.
     /// </summary>
     public int IntervalMs { get; set; }
 }

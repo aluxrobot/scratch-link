@@ -18,12 +18,12 @@ using AluxLabs.Link.JsonRpc;
 using AluxLabs.Link.Serial;
 
 /// <summary>
-/// Implements a USB Serial session on Windows using <see cref="SerialPort"/>
-/// for I/O and WMI for VID/PID-aware port discovery.
+/// Windows에서 I/O는 <see cref="SerialPort"/>로, VID/PID 기반 포트 검색은 WMI로 처리하는
+/// USB 시리얼 세션 구현.
 /// </summary>
 internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 {
-    // Serializes Read and Write on the same handle: concurrent calls trigger a TimeoutException burst on the read side with CH340/CP210x drivers.
+    // 같은 핸들에서 Read와 Write를 직렬화한다: CH340/CP210x 드라이버에선 동시 호출 시 read 쪽에 TimeoutException이 폭주한다.
     private readonly object ioLock = new object();
 
     private SerialPort port;
@@ -36,7 +36,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
     /// <summary>
     /// Initializes a new instance of the <see cref="WinSerialSession"/> class.
     /// </summary>
-    /// <param name="webSocket">The WebSocket connection for this session.</param>
+    /// <param name="webSocket">이 세션의 WebSocket 연결.</param>
     public WinSerialSession(IWebSocketConnection webSocket)
         : base(webSocket)
     {
@@ -90,8 +90,8 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
                 Handshake = MapFlowControl(openParams.FlowControl),
                 ReadTimeout = 500,
                 WriteTimeout = SerialPort.InfiniteTimeout,
-                // CH340 + codetinker firmware treats DTR/RTS transitions as a reset signal;
-                // pin them low explicitly so SerialPort.Open does not toggle them.
+                // CH340 + codetinker 펌웨어는 DTR/RTS 전이를 리셋 신호로 취급한다;
+                // SerialPort.Open이 이를 토글하지 않도록 명시적으로 low로 고정한다.
                 DtrEnable = false,
                 RtsEnable = false,
             };
@@ -125,7 +125,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             throw JsonRpc2Error.InvalidRequest("cannot write when not connected").ToException();
         }
 
-        // Sync Write under ioLock; see ioLock declaration for why. Task.Run keeps the async signature off the dispatcher thread.
+        // ioLock 하에서 동기 Write; 이유는 ioLock 선언부 참조. Task.Run으로 async 시그니처를 디스패처 스레드에서 떼어 둔다.
         try
         {
             await Task.Run(() =>
@@ -147,12 +147,12 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
         catch (InvalidOperationException)
         {
-            // Port was closed between the IsOpen check above and Write.
+            // 위의 IsOpen 확인과 Write 사이에 포트가 닫혔다.
             throw JsonRpc2Error.InvalidRequest("cannot write when not connected").ToException();
         }
         catch (IOException e)
         {
-            // A write IOException means the device vanished; escalate so the idle keep-alive resend surfaces removal fast.
+            // write 중 IOException은 장치가 사라졌다는 뜻; 분리를 빨리 드러내려 idle keep-alive 재전송으로 에스컬레이트한다.
             this.HandleSurpriseRemoval("device", e.Message);
             throw JsonRpc2Error.InternalError($"write failed: {e.Message}").ToException();
         }
@@ -163,7 +163,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
     /// <inheritdoc/>
     protected override async Task DoDisconnect()
     {
-        // Mark notified first: a client-initiated disconnect must not emit serialDidDisconnect, even if a removal races in.
+        // 먼저 notified 표시: 클라이언트가 시작한 disconnect는 분리가 레이스로 끼어들어도 serialDidDisconnect를 내보내면 안 된다.
         Interlocked.Exchange(ref this.disconnectNotified, 1);
         this.StopKeepAlive();
         this.StopRemovalWatcher();
@@ -178,7 +178,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             }
             catch
             {
-                // swallow: the loop's own error path already reported anything client-visible
+                // 무시: 루프 자체 에러 경로가 클라이언트에 보일 내용은 이미 보고했다
             }
         }
     }
@@ -253,7 +253,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
                 break;
             }
 
-            // Poll BytesToRead so Read is only called when there's data to drain — keeps ioLock hold time minimal.
+            // BytesToRead를 폴링해 데이터가 있을 때만 Read를 호출한다 — ioLock 점유 시간을 최소화한다.
             int available;
             try
             {
@@ -261,12 +261,12 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             }
             catch (ObjectDisposedException)
             {
-                // Derives from InvalidOperationException; catch first.
+                // InvalidOperationException에서 파생되므로 먼저 catch한다.
                 break;
             }
             catch (InvalidOperationException)
             {
-                // "Port closed" without a cancellation request means an external close (surprise removal), not our teardown.
+                // 취소 요청 없는 "Port closed"는 우리 teardown이 아니라 외부 종료(갑작스러운 분리)를 뜻한다.
                 if (!ct.IsCancellationRequested)
                 {
                     this.HandleSurpriseRemoval("device", "serial port closed unexpectedly");
@@ -287,10 +287,10 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 
             if (available <= 0)
             {
-                // Wait on ct.WaitHandle so cancellation wakes the loop immediately; otherwise sleep 10ms.
+                // ct.WaitHandle에서 대기해 취소 시 루프가 즉시 깨어나게 한다; 그 외엔 RX 인지 지연을 낮추려 1ms만 잔다.
                 try
                 {
-                    if (ct.WaitHandle.WaitOne(10))
+                    if (ct.WaitHandle.WaitOne(1))
                     {
                         break;
                     }
@@ -318,7 +318,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             }
             catch (TimeoutException)
             {
-                // Defensive: BytesToRead gate should prevent this.
+                // 방어적 처리: BytesToRead 게이트가 이를 막아야 한다.
                 continue;
             }
             catch (OperationCanceledException)
@@ -377,7 +377,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
         catch
         {
-            // ignored
+            // 무시
         }
 
         var localPort = this.port;
@@ -403,7 +403,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             }
             catch
             {
-                // ignored
+                // 무시
             }
         }
 
@@ -413,7 +413,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
         catch
         {
-            // ignored
+            // 무시
         }
     }
 
@@ -437,7 +437,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
         catch (Exception e)
         {
-            // Read-loop exceptions and keep-alive write failures remain as backup detection.
+            // 백업 감지 수단으로 read 루프 예외와 keep-alive write 실패가 남아 있다.
             Trace.WriteLine($"Failed to start USB removal watcher for {pnpDeviceId}: {e.Message}");
         }
     }
@@ -470,7 +470,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             return false;
         }
 
-        // Exact node, or our device is a child of a removed parent (hub) node. Avoid broad VID/PID-only matching.
+        // 정확히 그 노드이거나, 우리 장치가 제거된 상위(허브) 노드의 자식인 경우. VID/PID만으로 넓게 매칭하지 않는다.
         return mine.Equals(removedPnpId, StringComparison.OrdinalIgnoreCase)
             || mine.StartsWith(removedPnpId + "\\", StringComparison.OrdinalIgnoreCase);
     }
@@ -485,7 +485,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         _ = this.DidDisconnect(reason, message);
         this.CloseConnectionSilently();
 
-        // Stop off the WMI callback thread: ManagementEventWatcher.Stop can deadlock if called from EventArrived.
+        // WMI 콜백 스레드 밖에서 Stop: ManagementEventWatcher.Stop을 EventArrived에서 호출하면 데드락날 수 있다.
         _ = Task.Run(() => this.StopRemovalWatcher());
     }
 
@@ -515,7 +515,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
         catch
         {
-            // ignored
+            // 무시
         }
     }
 }
