@@ -23,6 +23,9 @@ using AluxLabs.Link.Serial;
 /// </summary>
 internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 {
+    // ERROR_OPERATION_ABORTED(Win32 995)의 HRESULT — 장치 분리가 아닌 I/O 취소를 분리와 구분하는 데 쓴다.
+    private const int ErrorOperationAborted = unchecked((int)0x800703E3);
+
     private SerialPort port;
     private CancellationTokenSource rxCts;
     private Task rxLoop;
@@ -85,6 +88,8 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
                 Parity = MapParity(openParams.Parity),
                 StopBits = MapStopBits(openParams.StopBits),
                 Handshake = MapFlowControl(openParams.FlowControl),
+
+                // 유한 timeout 필수: InfiniteTimeout이면 동시 write가 대기 중 read를 취소(ERROR_OPERATION_ABORTED)해 연결 직후 끊긴다.
                 ReadTimeout = 500,
                 WriteTimeout = SerialPort.InfiniteTimeout,
                 // CH340 + codetinker 펌웨어는 DTR/RTS 전이를 리셋 신호로 취급한다;
@@ -272,6 +277,13 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             }
             catch (IOException) when (ct.IsCancellationRequested)
             {
+                break;
+            }
+            catch (IOException e) when (e.HResult == ErrorOperationAborted)
+            {
+                // 취소(설정·동시성 문제)지 장치 분리가 아니다 — device로 오분류하지 않고 error로 드러낸다.
+                Trace.WriteLine($"Serial read aborted on {currentPort.PortName}: {e.Message}");
+                this.HandleSurpriseRemoval("error", e.Message);
                 break;
             }
             catch (IOException e)
