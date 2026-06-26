@@ -32,6 +32,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
     private ManagementEventWatcher removalWatcher;
     private string connectedPnpDeviceId;
     private int disconnectNotified;
+    private bool timerRaised;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="WinSerialSession"/> class.
@@ -105,6 +106,10 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
 
         Interlocked.Exchange(ref this.disconnectNotified, 0);
+
+        // RX 폴링의 WaitOne(1)이 1ms로 동작하도록 연결 동안만 시스템 타이머 분해능을 1ms로 올린다.
+        NativeMethods.TimeBeginPeriod(1);
+        this.timerRaised = true;
 
         this.rxCts = new CancellationTokenSource();
         var token = this.rxCts.Token;
@@ -368,6 +373,12 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 
     private void CloseConnectionSilently()
     {
+        if (this.timerRaised)
+        {
+            NativeMethods.TimeEndPeriod(1);
+            this.timerRaised = false;
+        }
+
         var localCts = this.rxCts;
         this.rxCts = null;
 
@@ -517,5 +528,14 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         {
             // 무시
         }
+    }
+
+    private static class NativeMethods
+    {
+        [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+        internal static extern uint TimeBeginPeriod(uint uMilliseconds);
+
+        [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+        internal static extern uint TimeEndPeriod(uint uMilliseconds);
     }
 }
