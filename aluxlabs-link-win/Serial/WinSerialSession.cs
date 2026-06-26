@@ -128,18 +128,10 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             throw JsonRpc2Error.InvalidRequest("cannot write when not connected").ToException();
         }
 
-        // Task.Run으로 동기 Write를 디스패처 스레드에서 떼어 둔다; read는 전용 스레드의 블로킹 BaseStream.Read와 전이중(overlapped)으로 동시 진행한다.
+        // overlapped WriteAsync로 곧장 송신 — Task.Run 스레드풀 홉을 없애 송신 지연·지터를 줄인다. read와 전이중으로 동시 진행한다.
         try
         {
-            await Task.Run(() =>
-            {
-                if (!currentPort.IsOpen)
-                {
-                    throw new InvalidOperationException("port closed");
-                }
-
-                currentPort.Write(data, 0, data.Length);
-            }).ConfigureAwait(false);
+            await currentPort.BaseStream.WriteAsync(data.AsMemory()).ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
         {
@@ -147,7 +139,7 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         }
         catch (InvalidOperationException)
         {
-            // 위의 IsOpen 확인과 Write 사이에 포트가 닫혔다.
+            // IsOpen 확인과 write 사이에 포트가 닫혀 BaseStream 접근이 실패했다.
             throw JsonRpc2Error.InvalidRequest("cannot write when not connected").ToException();
         }
         catch (IOException e)
@@ -272,6 +264,11 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             catch (TimeoutException)
             {
                 continue;
+            }
+            catch (OperationCanceledException)
+            {
+                // Close가 대기 중인 블로킹 read를 취소할 때 나오는 정상 종료 신호.
+                break;
             }
             catch (IOException) when (ct.IsCancellationRequested)
             {
