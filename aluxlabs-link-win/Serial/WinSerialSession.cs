@@ -23,16 +23,12 @@ using AluxLabs.Link.Serial;
 /// </summary>
 internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 {
-    // 같은 핸들에서 Read와 Write를 직렬화한다: CH340/CP210x 드라이버에선 동시 호출 시 read 쪽에 TimeoutException이 폭주한다.
-    private readonly object ioLock = new object();
-
     private SerialPort port;
     private CancellationTokenSource rxCts;
     private Task rxLoop;
     private ManagementEventWatcher removalWatcher;
     private string connectedPnpDeviceId;
     private int disconnectNotified;
-    private bool timerRaised;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="WinSerialSession"/> class.
@@ -107,13 +103,15 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 
         Interlocked.Exchange(ref this.disconnectNotified, 0);
 
-        // RX 폴링의 WaitOne(1)이 1ms로 동작하도록 연결 동안만 시스템 타이머 분해능을 1ms로 올린다.
-        NativeMethods.TimeBeginPeriod(1);
-        this.timerRaised = true;
-
         this.rxCts = new CancellationTokenSource();
         var token = this.rxCts.Token;
-        this.rxLoop = Task.Run(() => this.ReadLoop(token));
+
+        // 전용 백그라운드 스레드에서 BaseStream을 블로킹 read — 드라이버가 데이터 도착 시 깨우므로 폴링·타이머 분해능 의존이 없다.
+        this.rxLoop = Task.Factory.StartNew(
+            () => this.ReadLoop(token),
+            token,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
 
         this.StartKeepAlive();
         this.StartRemovalWatcher(info.PnpDeviceId);
@@ -130,20 +128,17 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
             throw JsonRpc2Error.InvalidRequest("cannot write when not connected").ToException();
         }
 
-        // ioLock 하에서 동기 Write; 이유는 ioLock 선언부 참조. Task.Run으로 async 시그니처를 디스패처 스레드에서 떼어 둔다.
+        // Task.Run으로 동기 Write를 디스패처 스레드에서 떼어 둔다; read는 전용 스레드의 블로킹 BaseStream.Read와 전이중(overlapped)으로 동시 진행한다.
         try
         {
             await Task.Run(() =>
             {
-                lock (this.ioLock)
+                if (!currentPort.IsOpen)
                 {
-                    if (!currentPort.IsOpen)
-                    {
-                        throw new InvalidOperationException("port closed");
-                    }
-
-                    currentPort.Write(data, 0, data.Length);
+                    throw new InvalidOperationException("port closed");
                 }
+
+                currentPort.Write(data, 0, data.Length);
             }).ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
@@ -248,87 +243,35 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 
     private void ReadLoop(CancellationToken ct)
     {
+        var currentPort = this.port;
+        if (currentPort == null)
+        {
+            return;
+        }
+
+        Stream stream;
+        try
+        {
+            stream = currentPort.BaseStream;
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
         var buf = new byte[4096];
 
         while (!ct.IsCancellationRequested)
         {
-            var currentPort = this.port;
-            if (currentPort == null || !currentPort.IsOpen)
-            {
-                break;
-            }
-
-            // BytesToRead를 폴링해 데이터가 있을 때만 Read를 호출한다 — ioLock 점유 시간을 최소화한다.
-            int available;
-            try
-            {
-                available = currentPort.BytesToRead;
-            }
-            catch (ObjectDisposedException)
-            {
-                // InvalidOperationException에서 파생되므로 먼저 catch한다.
-                break;
-            }
-            catch (InvalidOperationException)
-            {
-                // 취소 요청 없는 "Port closed"는 우리 teardown이 아니라 외부 종료(갑작스러운 분리)를 뜻한다.
-                if (!ct.IsCancellationRequested)
-                {
-                    this.HandleSurpriseRemoval("device", "serial port closed unexpectedly");
-                }
-
-                break;
-            }
-            catch (IOException) when (ct.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (IOException e)
-            {
-                Trace.WriteLine($"Serial BytesToRead IOException on {currentPort.PortName}: {e.Message}");
-                this.HandleSurpriseRemoval("device", e.Message);
-                break;
-            }
-
-            if (available <= 0)
-            {
-                // ct.WaitHandle에서 대기해 취소 시 루프가 즉시 깨어나게 한다; 그 외엔 RX 인지 지연을 낮추려 1ms만 잔다.
-                try
-                {
-                    if (ct.WaitHandle.WaitOne(1))
-                    {
-                        break;
-                    }
-                }
-                catch (ObjectDisposedException)
-                {
-                    break;
-                }
-
-                continue;
-            }
-
             int n;
             try
             {
-                lock (this.ioLock)
-                {
-                    if (!currentPort.IsOpen)
-                    {
-                        break;
-                    }
-
-                    n = currentPort.Read(buf, 0, Math.Min(available, buf.Length));
-                }
+                // 블로킹 read: 드라이버가 바이트 도착 시 스레드를 깨운다. ReadTimeout(500ms)마다 풀려 취소를 확인하므로 close 시 빠져나온다.
+                n = stream.Read(buf, 0, buf.Length);
             }
             catch (TimeoutException)
             {
-                // 방어적 처리: BytesToRead 게이트가 이를 막아야 한다.
                 continue;
-            }
-            catch (OperationCanceledException)
-            {
-                break;
             }
             catch (IOException) when (ct.IsCancellationRequested)
             {
@@ -373,12 +316,6 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
 
     private void CloseConnectionSilently()
     {
-        if (this.timerRaised)
-        {
-            NativeMethods.TimeEndPeriod(1);
-            this.timerRaised = false;
-        }
-
         var localCts = this.rxCts;
         this.rxCts = null;
 
@@ -528,14 +465,5 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
         {
             // 무시
         }
-    }
-
-    private static class NativeMethods
-    {
-        [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
-        internal static extern uint TimeBeginPeriod(uint uMilliseconds);
-
-        [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
-        internal static extern uint TimeEndPeriod(uint uMilliseconds);
     }
 }
