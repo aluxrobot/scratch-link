@@ -280,6 +280,17 @@ internal class WinSerialSession : SerialSession<WinSerialPortInfo>
                 this.HandleSurpriseRemoval("device", e.Message);
                 break;
             }
+            catch (UnauthorizedAccessException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (UnauthorizedAccessException e)
+            {
+                // USB 분리 시 핸들이 무효화돼 'access denied'로 나타난다 — IOException과 같은 장치 분리로 처리한다.
+                Trace.WriteLine($"Serial read access denied on {currentPort.PortName}: {e.Message}");
+                this.HandleSurpriseRemoval("device", e.Message);
+                break;
+            }
             catch (ObjectDisposedException)
             {
                 break;
