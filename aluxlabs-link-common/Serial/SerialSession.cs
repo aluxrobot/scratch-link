@@ -450,6 +450,7 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             Message = encoded,
         });
 
+        // 브라우저 RX 알림을 먼저 보낸 뒤 큐를 flush한다; flush를 앞에 두면 매 RX마다 브라우저 알림이 송신 한 번만큼 밀린다.
         if (flush)
         {
             await this.FlushTxQueue();
