@@ -442,12 +442,6 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             }
         }
 
-        // 큐 응답(지연 민감)을 브라우저 notify·인코딩보다 먼저 내보내 장치 송신 지연·지터를 줄인다; flush 대상은 현재 RX와 무관한 직전 큐 항목이다.
-        if (flush)
-        {
-            await this.FlushTxQueue();
-        }
-
         var encoded = EncodingHelpers.EncodeBuffer(data, "base64");
 
         await this.SendNotification("serialDidReceiveData", new SerialDataReceived
@@ -455,6 +449,12 @@ internal abstract class SerialSession<TPort> : PeripheralSession<TPort, string>
             Encoding = "base64",
             Message = encoded,
         });
+
+        // 브라우저 RX 알림을 먼저 보낸 뒤 큐를 flush한다; flush를 앞에 두면 매 RX마다 브라우저 알림이 송신 한 번만큼 밀린다.
+        if (flush)
+        {
+            await this.FlushTxQueue();
+        }
     }
 
     /// <summary>
