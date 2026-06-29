@@ -50,11 +50,11 @@ public class AluxLabsLinkApp
     public IServiceProvider Services { get; private set; }
 
     /// <summary>
-    /// Run the app.
+    /// Run the app and wait for the WebSocket server to be ready.
     /// </summary>
-    public void Run()
+    public Task RunAsync()
     {
-        this.webSocketListener.Start(string.Format("http://[::0]:{0}/", WebSocketPort));
+        return this.webSocketListener.StartAsync(string.Format("http://[::0]:{0}/", WebSocketPort));
     }
 
     /// <summary>

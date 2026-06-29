@@ -61,7 +61,12 @@ public partial class App : Application
 
         this.InitializeTrayIcon();
 
-        this.app.Run();
+        this.OnLaunchedAsync();
+    }
+
+    private async void OnLaunchedAsync()
+    {
+        await this.app.RunAsync();
     }
 
     private void InitializeTrayIcon()

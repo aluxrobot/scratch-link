@@ -16,6 +16,7 @@ internal class WebSocketListener
     private readonly CancellationTokenSource cts = new ();
 
     private WebSocketServer server;
+    private TaskCompletionSource serverReadyTcs;
 
     /// <summary>
     /// Gets or sets the action which will be called when the listener receives a WebSocket connection.
@@ -32,7 +33,7 @@ internal class WebSocketListener
     /// ws://127.0.0.1/
     /// </code></example>
     /// </param>
-    public void Start(string location)
+    public Task StartAsync(string location)
     {
         if (this.server != null)
         {
@@ -40,6 +41,7 @@ internal class WebSocketListener
             this.server.Dispose();
         }
 
+        this.serverReadyTcs = new TaskCompletionSource();
         this.server = new WebSocketServer(location);
         this.server.ListenerSocket.NoDelay = true; // disable Nagle's algorithm
 
@@ -53,6 +55,11 @@ internal class WebSocketListener
 
             this.OnWebSocketConnection(socket);
         });
+
+        // Signal that the server is ready after Start returns (Fleck binds in-thread)
+        Task.Run(() => this.serverReadyTcs.TrySetResult());
+
+        return this.serverReadyTcs.Task;
     }
 
     /// <summary>
